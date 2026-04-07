@@ -1,0 +1,75 @@
+[project]
+name = "mimicdreamer-egodex"
+version = "0.1.0"
+description = "Partial replication of MimicDreamer on the EgoDex dataset, with a dexterous-finger retargeting extension."
+requires-python = ">=3.13"
+
+# Base dependencies — needed from Stage 0 onward.
+# Stage-specific heavy deps live in [dependency-groups] below so other machines
+# can install only what they need: `uv sync --group stage1`, etc.
+dependencies = [
+    "h5py>=3.11",
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "matplotlib>=3.9",
+    "tqdm>=4.66",
+    "scipy>=1.14",
+    "jupyter>=1.1",
+    "ipykernel>=6.29",
+]
+
+[dependency-groups]
+# Stage 1 — EgoStabilizer
+stage1 = [
+    "vidstab>=1.7",
+]
+
+# Stage 2 — Action alignment / IK
+# mink uses quadprog by default; pull it explicitly for deterministic installs.
+stage2 = [
+    "mink>=0.0.6",
+    "quadprog>=0.1.13",
+]
+
+# Stage 3 — Dexterous finger retargeting
+stage3 = [
+    "dex-retargeting>=0.4.5",
+]
+
+# Stage 4 — Policy training extras (training-loop helpers, schedulers, etc).
+#
+# IMPORTANT: torch / torchvision are NOT listed here. The RTX 5090 (Blackwell,
+# sm_120) needs the cu128 nightly wheels, which depend on a local-version
+# pytorch-triton (3.7.0+git...) that uv's resolver refuses to fetch from the
+# nightly index. Install torch separately *after* `uv sync` with:
+#
+#     uv pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 \
+#         torch torchvision
+#
+# lerobot is also installed manually at Stage 4 because its current torch<2.11
+# ceiling conflicts with the cu128 nightlies. See plan.md for the exact recipe.
+stage4 = [
+    "einops>=0.8",
+    "wandb>=0.18",
+]
+
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+]
+
+# --- Tooling -----------------------------------------------------------------
+
+[tool.uv]
+# Reserved for future tweaks; torch is installed out-of-band (see stage4 note).
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mimicdreamer_egodex"]

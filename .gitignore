@@ -1,0 +1,28 @@
+# --- EgoDex data ---
+# 16 GB raw archive + extracted MP4s/HDF5s. Re-download per README.
+data/
+
+# --- Python / uv ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- Outputs ---
+# Derived artifacts (CSVs, stabilized clips, checkpoints, metrics).
+# Keep this directory ignored by default and force-add specific
+# deliverables (Stage 0 variance + calibration CSVs already committed).
+outputs/
+
+# --- Logs ---
+# Per-run stdout/stderr captures — large, ephemeral, regenerable.
+# The narrative session logs (logs/session_*.md) ARE committed.
+logs/runs/
+
+# --- Editor / IDE / OS ---
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
