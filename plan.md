@@ -240,7 +240,7 @@ directly as an IK task weight rather than thresholding twice.
 
 ## Open questions (resolve before the relevant stage)
 - **Stage 2**: Which arm URDF to target for IK? UR5e is the default in the mink
-  examples and matches what FIVER used. Confirm with Sanskar before locking in.
+  examples and matches what FIVER used. 
 - **Stage 3**: Does `dex-retargeting` ship an Inspire-hand config in `assets/`? If
   not, write a YAML for the Allegro hand instead — the dexterity story is the same.
 - **Stage 4**: MuJoCo eval env for `basic_pick_place` — build from scratch, or reuse
@@ -267,7 +267,7 @@ deliverable from `initial_plan.md` exists.
 ## Things we are explicitly NOT doing (yet)
 
 - **H2R visual diffusion**: requires paired real-robot data we don't have. Skipped
-  per `initial_plan.md` rationale. Revisit only if Sanskar provides paired data.
+  per `initial_plan.md` rationale.
 - **Training on all 194 EgoDex tasks**: stick to `basic_pick_place` for the
   ablation, per §4.2. Scale experiments belong to "potential original
   contributions" §4.
