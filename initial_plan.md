@@ -1,18 +1,10 @@
 # MimicDreamer Replication Plan
-### Angkul — Internship Prep + Research Contribution Roadmap
 ### Dataset: EgoDex (Apple, 829h) | Focus: Dexterous Manipulation
 
 ---
 
 ## Context & Goals
 
-You are replicating the core of MimicDreamer (minus the H2R visual diffusion step, which
-requires paired real robot data) using the EgoDex dataset from Apple. The goal is twofold:
-
-1. **Show up to the Fidelity Dynamics internship with a working partial replication** —
-   this demonstrates you understand the full pipeline and can contribute immediately.
-2. **Identify where you can make original contributions** to Sanskar's enrichment pipeline,
-   using EgoDex as a high-quality reference for what good dexterous data looks like.
 
 The plan has **4 stages**, ordered by dependency. Each stage produces a concrete artifact.
 
@@ -362,10 +354,6 @@ in LeRobot-compatible format.
 ## Stage 3: Dexterous Finger Retargeting (1.5 weeks)
 **Goal**: Retarget EgoDex 25-joint finger poses to a robot dexterous hand.
 
-This is what makes your work specifically relevant to Sanskar's dexterity focus, and
-it's something MimicDreamer doesn't fully address (they only handle wrist + gripper).
-Skip this stage if pressed for time and come back during the internship.
-
 ### 3.1 — Why Finger Retargeting Is Non-Trivial
 Human finger kinematics don't map cleanly to robot hands because joint ranges, DOF
 counts, and thumb kinematics all differ by embodiment. You need to retarget *relative
@@ -469,31 +457,6 @@ replication with dexterous extension.
 
 ---
 
-## Potential Original Contributions (Internship Pitches)
-
-**1. Confidence-aware trajectory filtering**
-EgoDex gives ARKit tracking confidence at every frame. Reject low-confidence segments
-before IK. MimicDreamer ignores confidence entirely — this is a free data quality win
-you can measure and ablate.
-
-**2. Finger-contact-aware IK weighting**
-When hand openness approaches zero (predicted contact event), upweight the IK position
-accuracy term. This should improve IK quality precisely at grasps and placements.
-
-**3. Skill segmentation from language annotations**
-EgoDex has natural language task descriptions for every episode. Use an LLM to segment
-long episodes into skill primitives (reach, grasp, transport, insert, release) with
-timestamps. Your LLM post-training background is directly useful here — you understand
-how to design reward signals that could grade segment quality.
-
-**4. Scale experiment: how much data is enough?**
-Train on 10, 50, 100, 500, 1000 episodes and plot success rate vs. data size.
-MimicDreamer did this for 6 tasks (Figure 3). Doing it for dexterous tasks on EgoDex
-is a clean replication + extension that's publishable as a workshop paper.
-
-**5. Cross-embodiment transfer**
-Train on EgoDex, evaluate by swapping robot URDF in the IK solver. Tests whether the
-pipeline is truly embodiment-agnostic — a key claim for a data company like Fidelity.
 
 ---
 
@@ -506,8 +469,6 @@ pipeline is truly embodiment-agnostic — a key claim for a data company like Fi
 | 4–5 | Stage 2 | `action_alignment.py` + joint angles + variance check |
 | 6 | Stage 3 | `finger_retargeting.py` + MuJoCo visualization |
 | 7–8 | Stage 4 | Trained policy + ablation table + write-up |
-
-Total: **8 weeks** → summer internship start.
 
 ---
 
