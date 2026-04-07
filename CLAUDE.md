@@ -5,8 +5,7 @@ Keep it short and load-bearing; long-form notes go in `plan.md`.
 
 ## What this project is
 Partial replication of **MimicDreamer** on the **EgoDex** dataset (Apple, 829h egocentric
-dexterous manipulation), with a finger-retargeting extension. Target: working pipeline by
-the time the Fidelity Dynamics internship starts.
+dexterous manipulation), with a finger-retargeting extension.
 
 **Three load-bearing docs** — read them in this order if you don't already have context:
 1. `initial_plan.md` — original 4-stage roadmap (immutable reference).
