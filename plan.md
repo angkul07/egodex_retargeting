@@ -271,8 +271,3 @@ deliverable from `initial_plan.md` exists.
 - **Training on all 194 EgoDex tasks**: stick to `basic_pick_place` for the
   ablation, per §4.2. Scale experiments belong to "potential original
   contributions" §4.
-- **Confidence-aware filtering, finger-contact-aware IK weighting, skill
-  segmentation, scale experiments, cross-embodiment transfer**: these are the
-  five contribution pitches in `initial_plan.md`. Pick at most one to attempt
-  before the internship — most likely **confidence-aware filtering**, since it's
-  the cheapest and falls naturally out of Stage 2.
