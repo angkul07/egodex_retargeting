@@ -2,7 +2,7 @@
 
 Partial replication of [MimicDreamer](https://arxiv.org/abs/2509.22199) on the
 [EgoDex](https://arxiv.org/abs/2505.11709) dataset, with a dexterous-finger
-retargeting extension. Built for an internship-prep timeline, not for production.
+retargeting extension.
 
 Documentation map:
 - `initial_plan.md` — original 4-stage roadmap (read-only).
