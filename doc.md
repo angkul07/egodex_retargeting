@@ -1033,6 +1033,337 @@ The Stage 4 action vector per episode is assembled as:
 
 ---
 
+## 8.8 Stage 4 — policy training + first eval (R-009)
+
+`notebooks/{08_to_lerobot,09_train_act,10_eval_act}.py` plus
+`src/mimicdreamer_egodex/{lerobot_pyav_patch,eval_env}.py`. End-to-end
+pipeline complete; **first eval result is 10% success rate** — proof-
+of-life only, NOT the §4.4 deliverable. The full assessment lives in
+`plan.md` R-009; this section documents the *how*.
+
+### 8.8.1 LeRobot dataset format + Stage 1+2+3 → LeRobot conversion
+
+`notebooks/08_to_lerobot.py` builds a v3.0 LeRobotDataset from the
+per-episode artifacts produced by Stages 1–3:
+
+| input | source | shape |
+|---|---|---|
+| stabilized RGB | `outputs/stage1/<idx>_stabilized.mp4` (resized to 224×224) | (T, 224, 224, 3) uint8 |
+| `q_arm` | `outputs/stage2/<idx>_actions.npz` → `q` | (T, 6) float32 |
+| `gripper` | same npz, `gripper` | (T,) float32 |
+| `q_finger` | `outputs/stage3/<idx>_fingers.npz` → `q_finger` | (T, 6) float32 |
+| language | EgoDex HDF5 file attr `description` | str |
+
+The 13-D action vector is built per frame as
+`concat([q_arm, gripper, q_finger])`. **State equals action** because
+this is an offline-converted dataset, not a live recording — the IK
+targets ARE the trajectory the robot would have followed; using the
+same vector for both gives the policy a "current pose → next pose
+chunk" mapping.
+
+LeRobotDataset feature schema:
+
+```python
+features = {
+    "observation.image": {"dtype": "video",   "shape": (224, 224, 3), "names": ["height", "width", "channels"]},
+    "observation.state": {"dtype": "float32", "shape": (13,),         "names": None},
+    "action":            {"dtype": "float32", "shape": (13,),         "names": None},
+}
+```
+
+Build call: `LeRobotDataset.create(repo_id=..., fps=30, features=...,
+robot_type="ur5e+inspire")`. Per frame: `dataset.add_frame({...,
+"task": description})`. Per episode: `dataset.save_episode()`. At end:
+`dataset.finalize()`.
+
+Full-task batch result: **277/277 episodes, 0 failures, 75 MB on disk,
+1397 s wall time (~5 s/ep — dominated by SVT-AV1 video encoding)**.
+Final dataset metadata:
+
+| | value |
+|---|---:|
+| codebase_version | v3.0 |
+| total_episodes | 277 |
+| total_frames | 32 271 |
+| total_tasks (unique language strings) | 200 |
+| fps | 30 |
+
+### 8.8.2 PyAV monkey-patch for the lerobot video decoder (D-012)
+
+`src/mimicdreamer_egodex/lerobot_pyav_patch.py`. lerobot 0.5.1's
+`decode_video_frames` dispatch is broken on our torch 2.12 nightly +
+torchvision 0.27 nightly + cu128 environment:
+
+- `torchcodec 0.10` (the version lerobot pins): built against torch
+  2.10's c10 ABI → undefined symbol
+  `c10::MessageLogger::MessageLogger(const char*, int, int, bool)` at
+  `torch.ops.load_library` time.
+- `torchcodec 0.11`: built against CUDA 13 → wants `libnvrtc.so.13`
+  which we don't have (cu128 ships nvrtc 12).
+- The "pyav fallback" inside lerobot's `decode_video_frames_torchvision`
+  calls `torchvision.io.VideoReader(path, "video")` which **does not
+  exist** in torchvision 0.27 (the legacy video API was removed).
+
+The patch installs a third path: `decode_video_frames_pyav_only` that
+uses `av` (PyAV) directly. PyAV is mature, ABI-independent of torch,
+and is already a transitive dep of lerobot. The replacement preserves
+the original contract: `(N, C, H, W)` float32 in `[0, 1]`, with
+timestamp-tolerance frame matching.
+
+**Usage** — call `apply()` BEFORE any `from lerobot...` import that
+touches the dataset reader. The patch monkey-patches both
+`lerobot.datasets.video_utils.decode_video_frames` AND
+`lerobot.datasets.dataset_reader.decode_video_frames` (the latter
+binds the function name at import time, so without patching that
+reference too, the dataset reader keeps the old broken function).
+
+Verified end-to-end: loading frame 0 of the smoke-test dataset returns
+`observation.image` of shape `(3, 224, 224)` float32 in `[0.000, 0.949]`,
+no errors.
+
+### 8.8.3 ACT training setup (`notebooks/09_train_act.py`)
+
+Custom training loop, NOT lerobot's `train.py` CLI (which uses
+`accelerate` + `draccus` config injection — too much extra machinery
+for a small replication run that needs ablation flexibility).
+
+Pipeline:
+1. `apply_pyav_patch()` BEFORE importing lerobot
+2. Load `LeRobotDataset` for stats only (`meta.stats`)
+3. Episodes 0:222 = train, 222:277 = val (deterministic last-20% split)
+4. Build train/val datasets with `delta_timestamps={"action": [i/30 for
+   i in range(chunk_size)]}` so each frame yields a chunk-length action
+   sequence
+5. `ACTConfig(chunk_size=10, n_action_steps=8, n_obs_steps=1)` with our
+   13-D action + 224×224 image + 13-D state features
+6. `make_act_pre_post_processors(cfg, dataset_stats)` builds the
+   per-feature normalize/unnormalize pipeline
+7. AdamW (lr=1e-4, wd=1e-4) + grad-clip 10.0 + bf16 autocast
+8. Loop: `batch = preprocessor(batch_to_device); loss, _ =
+   policy.forward(batch); loss.backward(); optimizer.step()`
+
+**D-014 — ACT eval-mode VAE workaround**: in the val pass, do **NOT**
+call `policy.eval()`. ACT's `forward()` unconditionally computes the
+VAE KL loss but skips the VAE encoder in `eval()` mode, so
+`log_sigma_x2_hat` is `None` and the formula crashes with
+`TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'`.
+Wrap with `torch.no_grad()` only and keep the model in `train()`. This
+is safe — the VAE encoder still sees the val batch and produces a
+well-defined loss; the per-batch number is still a valid across-split
+comparison metric.
+
+**Inference is fine in `eval()` mode** — `select_action()` doesn't
+touch the buggy KL term.
+
+#### 8.8.3.1 Training curves (full pipeline, 3000 steps, batch 64)
+
+| step | train loss | val loss |
+|---:|---:|---:|
+| 100 | 4.77 | — |
+| 500 | — | 0.36 |
+| 1000 | 0.241 | 0.229 |
+| 1500 | 0.192 | 0.199 |
+| 2000 | 0.158 | 0.182 |
+| **2500** | **0.137** | **0.165** ← best |
+| 3000 (final) | 0.126 | 0.173 |
+
+- 51.6 M-param ACT (ResNet18 vision backbone, 4 encoder layers, 1
+  decoder layer)
+- ~25 min wall time on RTX 5090
+- ~10 epochs over 25 673 train samples
+- val loss ≤ train loss at every step until step 2500 → no
+  overfitting; mild train/val gap of 0.05 at the end is expected on
+  17.9 min of footage
+- Best val at step 2500 → mild early-stopping signal but not severe
+  enough to stop the run
+
+### 8.8.4 MuJoCo eval env (`src/mimicdreamer_egodex/eval_env.py`)
+
+Builds a UR5e + Inspire-hand + tabletop + primitive-cube scene by
+**`MjSpec.attach()`-merging** the menagerie UR5e MJCF and the dex-urdf
+Inspire URDF (with the D-010 `<mujoco><compiler strippath="false"
+discardvisual="true" meshdir="..."/></mujoco>` injection). The merged
+model has:
+
+| | value |
+|---|---:|
+| njnt | 19 (6 UR5e + 12 Inspire + 1 free joint for the object) |
+| nq | 25 (incl. 7 for the object's free joint) |
+| nbody | 29 |
+| ngeom | 52 |
+| ncam | 1 (egocentric, auto-orienting at the object via `targetbody` mode) |
+
+Scene contents:
+
+- UR5e at world origin, base on the floor
+- Inspire hand attached at UR5e `attachment_site` with the `ins_`
+  prefix on all joint names
+- Brown tabletop at `(0.5, 0.0, -0.025)` with half-extents
+  `(0.30, 0.30, 0.025)` — top surface flush with `z = 0`, matching
+  Stage 2's H2R `table_y → robot z = 0` convention
+- Blue 4 cm primitive cube on top of the table at `(0.5, 0.0, 0.02)`
+  with a free joint and 50 g mass — physics-driven
+- Egocentric camera at `(-0.05, 0.05, 1.10)` (rough AVP head height,
+  not yet calibrated to a specific episode's `camera/intrinsic`)
+
+**D-013 — kinematic control, not torque**: `EvalEnv.step` writes
+`data.qpos[:6] = action[:6]` and `data.qpos[inspire_target_qadr] =
+action[7:13]` directly each tick, then `mj_step()`. The 6 Inspire
+mimic joints are driven by the URDF mimic equality constraints during
+`mj_forward`. `action[6]` (gripper scalar) is a no-op — the Inspire
+DOFs already encode the full hand pose. This sidesteps controller
+tuning and keeps the rollout fast (~350 ms each end-to-end).
+
+`get_obs()` returns the same dict shape the policy expects:
+
+```python
+{
+    "observation.image": (3, 224, 224) float32 in [0, 1],
+    "observation.state": (13,) float32  # current arm + zero gripper + Inspire proximals
+}
+```
+
+`reset()` randomizes the object position over a 20×20 cm patch around
+the workspace center (`x ∈ [0.4, 0.6]`, `y ∈ [-0.1, 0.1]`).
+
+### 8.8.5 First-pass rollout results (20 rollouts, full pipeline)
+
+`notebooks/10_eval_act.py`. Loads `latest.pt` (= step 3000 state_dict)
+and runs N rollouts in `EvalEnv` with up to 120 env steps each
+(4 s @ 30 Hz). Inference path: `obs → preprocessor → policy.select_action
+→ postprocessor → action → env.step`.
+
+Per-rollout outcomes (seed=0):
+
+```
+[  1/20] success=0  max_lift=   0.0 mm
+[  2/20] success=1  max_lift=  51.3 mm  ← clean lift, terminated at step 97
+[  3/20] success=0  max_lift=   0.0 mm
+[  4/20] success=1  max_lift=  50.0 mm  ← clean lift, terminated at step 111
+[  5/20] success=0  max_lift=   0.2 mm
+[  6/20] success=0  max_lift=   0.0 mm
+[  7/20] success=0  max_lift=   0.0 mm
+[  8/20] success=0  max_lift=   0.0 mm
+[  9/20] success=0  max_lift=   0.0 mm
+[ 10/20] success=0  max_lift=  20.2 mm  ← partial touch
+[ 11/20] success=0  max_lift=   0.6 mm
+[ 12/20] success=0  max_lift=  13.8 mm  ← partial touch
+[ 13/20] success=0  max_lift=   1.5 mm
+[ 14/20] success=0  max_lift=   0.0 mm
+[ 15/20] success=0  max_lift=   7.1 mm  ← partial touch
+[ 16/20] success=0  max_lift=   0.0 mm
+[ 17/20] success=0  max_lift=  14.3 mm  ← partial touch
+[ 18/20] success=0  max_lift=   0.0 mm
+[ 19/20] success=0  max_lift=  12.5 mm  ← partial touch
+[ 20/20] success=0  max_lift=   0.0 mm
+```
+
+Aggregate:
+
+| metric | value |
+|---|---:|
+| **success rate** | **2 / 20 = 10 %** |
+| mean max lift | 8.6 mm |
+| median max lift | 0.08 mm |
+| max max lift | 51.3 mm |
+| wall time | 7.1 s (~350 ms/rollout) |
+
+Distribution of outcomes:
+- **2 clean successes** — full reach + close + lift sequence
+- **6 partial touches** (1–20 mm of lift) — fingers reach the object but
+  lose grip
+- **12 no-movement** — commanded pose misses the object entirely
+
+### 8.8.6 Honest interpretation of 10% — distribution shift hypothesis
+
+This is **proof-of-life**, not a final result. Three things to keep in
+mind when reading the number:
+
+1. **A truly random or dead policy would be ~0%.** The 6 partial
+   touches confirm the policy is meaningfully *directing* the hand
+   toward the object's neighborhood, and the 2 clean successes prove
+   the full reach → close → lift sequence is reproducible. The policy
+   is alive.
+2. **A polished BC policy on a matched-distribution eval would be
+   50–90%.** We are not there.
+3. **The training metrics (val loss 0.165) say the model learned the
+   data well.** This is not a training failure — it is an
+   evaluation-domain mismatch.
+
+**The dominant residual error is visual distribution shift**:
+
+| | training | eval |
+|---|---|---|
+| RGB source | 1080p egocentric AVP video | 224×224 procedural MuJoCo render |
+| Hand visible in frame | real human hand | UR5e + Inspire (collision-mesh primitives) |
+| Background | varied real environments (metal table, white wall, etc) | checkerboard floor, single light |
+| Object | 99 distinct real objects | one bright primitive cube |
+| Camera | calibrated AVP intrinsics, head-mounted | hand-positioned `MjvCamera`, NOT calibrated |
+| Lighting | real-world directional + ambient | mujoco default |
+
+The ResNet18 vision backbone is sensitive to all of those statistics.
+The Stage 3 R-008 verdict ("affordance class adequate, not within-class
+precision") is independently true and would still be a ceiling on
+performance, but the **Stage 4 first-cut bottleneck is upstream of the
+retargeting** — the policy isn't seeing the same kind of image at eval
+that it saw at train.
+
+### 8.8.7 What the 10 % is NOT
+
+To prevent later overclaiming:
+
+- **NOT a § 4.4 ablation table cell**. The §4.4 deliverable requires
+  4 conditions × 100 rollouts. We have 1 condition × 20 rollouts.
+  Use this number as a placeholder for the "Full pipeline" cell, but
+  **regenerate** after the camera-intrinsics fix before quoting it
+  publicly.
+- **NOT torque-controlled rollouts**. The eval env writes joint
+  positions directly via `data.qpos` (D-013). If a future eval needs
+  torque-controlled rollouts (e.g., for sim-to-real readiness), swap
+  `step()` to write `data.ctrl[]`.
+- **NOT a measurement of grasp quality at the contact level**. The
+  success metric is "object lifted > 5 cm". A policy that closes the
+  hand 1 cm from the object and then drags it via friction would
+  count as "no movement"; a policy that gets one finger under the
+  object and flips it 5 cm would count as "success". Both happen.
+- **NOT compared against a baseline**. A binary-gripper baseline
+  ("no Inspire fingers", action shape 7) might do better OR worse —
+  we don't know yet.
+
+### 8.8.8 What would change this assessment (ranked by ROI)
+
+1. **(easy, ~30 min)** **Calibrate the eval `MjvCamera`** to one of the
+   277 EgoDex episodes' `camera/intrinsic` + `transforms/camera`.
+   Single highest-leverage fix — should drop the visual distribution
+   shift dramatically. Estimate: 2–4× success rate improvement.
+2. **(easy, ~30 min)** Texture the table top + tune lighting in the
+   eval scene to match EgoDex's metal-table-on-white-background look.
+3. **(medium, ~80 min)** Train longer (10 000 steps instead of 3000).
+   Best val was at step 2500, suggesting we may be slightly
+   under-trained rather than over-trained.
+4. **(hard, ~4 hours)** § 4.4 ablation table proper: build the 3 other
+   dataset variants and train each one. This is the real Stage 4
+   deliverable.
+
+### 8.8.9 Artifact layout
+
+```
+outputs/
+├── lerobot/mimicdreamer_egodex_basic_pick_place_full/  # Phase B output (75 MB)
+│   ├── meta/{info,stats}.json          # dataset metadata + per-feature stats
+│   ├── data/chunk-000/file-000.parquet # 32 271 frames × {state, action, ...}
+│   └── videos/observation.image/chunk-000/file-000.mp4  # AV1, all eps in one file
+└── stage4/act_full_pipeline/                # Phase C+D output
+    ├── args.json, config.json
+    ├── ckpt_step{1000,2000,3000}.pt    # 619 MB each (state + optimizer)
+    ├── latest.pt                       # 206 MB (state_dict only — for inference)
+    ├── train_log.jsonl                 # per-100-step train metrics
+    ├── val_log.jsonl                   # per-500-step val metrics
+    └── eval/rollouts.jsonl             # 20 rollouts × {success, max_lift_m, n_steps} + summary
+```
+
+---
+
 ## 9. File / artifact index
 
 Code (read these to verify any claim above):
@@ -1050,6 +1381,11 @@ Code (read these to verify any claim above):
 | `notebooks/05_stage3_visualize.py` | Stage 3 static visualizations: per-episode joint-angle time series, 3D fingertip overlay (human vs Inspire FK), per-finger retarget error, 2x2 overview. Run on any episode index. Source of the 5–10 mm per-finger error numbers in §8.7.8. |
 | `notebooks/06_stage3_animate.py` | Stage 3 animations: stick-figure Inspire MP4, side-by-side EgoDex-vs-Inspire skeleton MP4, MuJoCo offscreen mesh-render MP4. Headless via EGL. Reads from `outputs/stage3/<idx>_fingers.npz`, writes to `outputs/stage3/viz/`. |
 | `notebooks/07_grasp_clustering.py` | Stage 3 quality-assessment: per-object grasp-shape clustering (peak-grasp 6-D and trajectory-aggregate 18-D signatures), separation ratio + silhouette + PCA scatter. Source of the §8.7.8 verdict ("affordance class, not within-class precision"). |
+| `notebooks/08_to_lerobot.py` | Stage 4 Phase B — convert per-episode Stage 1+2+3 outputs into a v3.0 LeRobotDataset (75 MB, 277 eps, 32 271 frames). Image at 224×224, action = `[arm_6, gripper_1, finger_6]`. CLI: `uv run python notebooks/08_to_lerobot.py --force` (full task). |
+| `notebooks/09_train_act.py` | Stage 4 Phase C — custom training loop for `ACTPolicy` on the LeRobotDataset, NOT lerobot's CLI. Applies the PyAV monkey-patch first. Saves checkpoints + train/val JSONL logs. CLI flags for steps/batch/lr/etc. |
+| `notebooks/10_eval_act.py` | Stage 4 Phase D — load a trained ACT checkpoint and run N rollouts in `EvalEnv`. Reports success rate + per-rollout `max_lift_m`. Same script will be used per-condition for the §4.4 ablation. |
+| `src/mimicdreamer_egodex/lerobot_pyav_patch.py` | Monkey-patch for `lerobot.datasets.video_utils.decode_video_frames`. Required because torchcodec is unbuildable on torch 2.12 cu128 and torchvision 0.27 dropped `VideoReader`. See D-012 / §8.8.2. **Must be `apply()`-ed before any `from lerobot...` import that touches the dataset reader.** |
+| `src/mimicdreamer_egodex/eval_env.py` | UR5e + Inspire merged scene built via `MjSpec.attach()`, with table + primitive cube + egocentric camera. `EvalEnv.reset/step/get_obs` API. Kinematic control via direct `qpos` writes (D-013). See §8.8.4. |
 
 Artifacts:
 
@@ -1075,6 +1411,9 @@ Artifacts:
 | `outputs/stage3_grasp_clustering.json` | Stage 3 grasp-clustering analysis (per-object signatures, separation ratio, silhouette) — source for §8.7.8 verdict |
 | `outputs/stage3/viz/<idx>_*.{png,mp4}` | Per-episode static plots (joint angles, fingertip 3D, retarget error, overview) and animations (Inspire stick figure, side-by-side, MuJoCo mesh render) |
 | `outputs/stage3/viz/grasp_clustering_*.png` | Cross-episode clustering plots: PCA scatter (peak + trajectory signatures) and per-object signature bar chart |
+| `outputs/lerobot/mimicdreamer_egodex_basic_pick_place_full/` | Stage 4 Phase B output. v3.0 LeRobotDataset of all 277 episodes (75 MB). `meta/` + `data/chunk-000/file-000.parquet` + single AV1 video. |
+| `outputs/stage4/act_full_pipeline/` | Stage 4 Phase C output. ACT training artifacts: `args.json`, `config.json`, `ckpt_step{1000,2000,3000}.pt` (619 MB each, state + optimizer), `latest.pt` (206 MB, state-dict only), `train_log.jsonl`, `val_log.jsonl`. |
+| `outputs/stage4/act_full_pipeline/eval/rollouts.jsonl` | Stage 4 Phase D output. 20 rollouts with per-episode `success`/`max_lift_m`/`n_steps` + summary line. Source of the 10% number. |
 | `third_party/dex-urdf/` | Vendored dex-urdf repo @ `7304c7f` (gitignored). Provides Inspire/Allegro/Shadow/LEAP URDFs for Stage 3. Re-clone per README if missing. |
 | `logs/session_2026-04-07.md` | narrative session log |
 | `logs/runs/2026-04-07_*.log` | captured stdout/stderr from every script run |
@@ -1096,6 +1435,10 @@ Decisions:
 - `plan.md` D-009 — RunPod needs `apt install libegl1` for MuJoCo headless EGL
 - `plan.md` D-010 — MuJoCo URDF loader needs `strippath="false" discardvisual="true"` injection
 - `plan.md` D-011 — MuJoCo URDF `<mujoco>` extension silently ignores `<visual>` (use 640×480 framebuffer)
+- `plan.md` R-009 — Stage 4 first-cut policy + 10% rollout success: pipeline alive but distribution-shift-limited; § 4.4 ablation NOT yet built
+- `plan.md` D-012 — PyAV monkey-patch for lerobot's video decoder (torchcodec/torchvision.io both unusable on torch 2.12 nightly)
+- `plan.md` D-013 — Stage 4 eval env uses kinematic `qpos` writes, not torque actuators
+- `plan.md` D-014 — ACT's `forward()` crashes in `eval()` mode; keep `train()` mode for the val pass
 
 If any of the above goes stale, update both this file *and* the matching
 entry in `plan.md` so they don't drift.

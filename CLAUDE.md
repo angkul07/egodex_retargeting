@@ -147,5 +147,27 @@ file paths and dataset IDs touched, hyperparameters.
   injection. Offscreen framebuffer is fixed at 640×480 for URDF-based
   models (the `<visual><global/>` extension is silently ignored). See
   `plan.md` D-009 / D-010 / D-011.
+- **lerobot on torch 2.12 cu128**: install via
+  `uv pip install --no-deps lerobot` + bulk-install transitive deps
+  (see plan.md D-001 recipe). torchcodec is unbuildable on this combo
+  (cu13 wheels) and torchvision 0.27 nightly removed `VideoReader`, so
+  **always call `mimicdreamer_egodex.lerobot_pyav_patch.apply()` before
+  any `from lerobot...` import that touches the dataset reader**. The
+  patch installs a PyAV-only video decoder. See `plan.md` D-012.
+- **ACT custom training loop quirk**: in any val pass do **NOT** call
+  `policy.eval()`. ACT's `forward()` crashes computing the VAE KL term
+  when the VAE encoder is skipped. Wrap with `torch.no_grad()` only and
+  keep the model in `train()`. Inference (`select_action()`) is fine in
+  `eval()` mode because that path doesn't touch the buggy term. See
+  `plan.md` D-014.
+- **Stage 4 first-cut result is 10 % rollout success (R-009)** — the
+  whole pipeline (HDF5 → stab → IK → finger retargeting → LeRobot →
+  ACT → MuJoCo rollouts) works end-to-end, but this is **proof-of-life,
+  NOT the § 4.4 deliverable**. Dominant residual error = visual
+  distribution shift between training (real EgoDex egocentric video)
+  and eval (procedural MuJoCo render). Highest-leverage fix: calibrate
+  the eval `MjvCamera` intrinsics to one of the 277 EgoDex episodes.
+  § 4.4 ablation requires 3 more dataset variants + 3 more training
+  runs. See `plan.md` R-009 and `doc.md` §8.8.
 - Always write a "variance check" output when producing trajectories — the FIVER v1
   failure mode (collapsed joint ranges) is the thing we're explicitly trying to avoid.

@@ -32,3 +32,6 @@ third_party/
 .vscode/
 .DS_Store
 Thumbs.db
+
+
+.cache/

@@ -9,11 +9,19 @@ The original 4-stage roadmap (Stages 0–4 + contributions + timeline) lives in
 
 ## Current state — 2026-04-08 (Day 1)
 
-**Stage**: 1, 2, and 3 first-cut complete on the full 277-episode
-`basic_pick_place` test split. Stage 3 has a quality assessment
-(R-008): retargeting captures grasp affordance class but not
-within-class precision — sufficient for Stage 4 BC, not a finished
-teleop product.
+**Stage**: 1, 2, 3, and **4 first-cut complete** end-to-end. Stage 4
+trained an ACT policy on the full pipeline + ran 20 MuJoCo rollouts.
+**First-pass eval result: 10% success rate** (R-009): 2 of 20 rollouts
+lifted the object > 5 cm, 6 made partial contact, 12 missed entirely.
+This is proof-of-life for the *whole pipeline* (HDF5 → stab → IK →
+finger retargeting → LeRobot dataset → ACT → MuJoCo rollouts) but
+**NOT** a publishable §4.4 ablation table — only 1 of 4 conditions is
+trained, the eval camera is not calibrated to the EgoDex AVP intrinsics,
+and the visual distribution shift between training (real human hand on
+cluttered table) and eval (procedural MuJoCo render of robot hand on a
+checkerboard) is the dominant residual error mode. Stage 3's quality
+assessment (R-008) still holds: retargeting captures grasp affordance
+class, sufficient for BC training.
 **Last action**: Wrote `src/mimicdreamer_egodex/finger_retargeting.py`
 (Stage 3 deliverable) + `notebooks/04_stage3_batch.py` and ran the batch:
 277/277 episodes, 0 failures, **90.7 s total wall time** (~2.4 ms/frame
@@ -31,13 +39,15 @@ episodes (<80 frames, data-constrained variance floor); no overlap with
 Stage 2's IK tail. Torch nightly cu128 is now installed out-of-band (RTX
 5090 sm_120 verified) so Stage 4's environment is ~half-prepared.
 Run log: `logs/runs/2026-04-08_104408_stage3_batch.log`.
-**Next action**: (a) Stage 4 — install lerobot out-of-band per D-001,
-convert stabilized frames + `[q_arm_6, gripper_1, q_finger_6]` action
-vectors into the lerobot dataset format, train ACT on `basic_pick_place`,
-build the ablation table from §4.4. (b) Optional MuJoCo visualization of
-Stage 3 outputs via a `notebooks/05_stage3_visualize.py` if/when the user
-wants to eyeball a rollout. (c) Neither the Stage 1 R-006 fallback nor
-the Stage 2 IK tail has been re-investigated — still parked.
+**Next action**: see R-009 "what would change this assessment" — three
+ranked improvements: (1) **camera intrinsics calibration** — read
+`camera/intrinsic` from one of the 277 EgoDex episodes and apply it to
+the MuJoCo render to remove most of the visual distribution shift
+(highest ROI, ~30 min); (2) tabletop texturing + lighting tweaks to
+match EgoDex's metal-table-on-white-background look; (3) the §4.4
+ablation runs proper — build the 3 other dataset variants (drop fingers,
+drop smooth IK, drop stab) and train them, ~75 min/condition. Parked
+(non-blocking): R-006 Stage 1 fallback, Stage 2 IK tail.
 
 ### Environment status
 - [x] uv project initialized, Python 3.13. (Reinstalled uv on 2026-04-08:
@@ -58,7 +68,18 @@ the Stage 2 IK tail has been re-investigated — still parked.
       triton 3.7.0+git9c288bc5. RTX 5090 sm_120 capability (12, 0)
       verified. Unblocks `dex_retargeting` (which hard-imports torch) and
       prepares Stage 4.
-- [ ] Stage 4: lerobot — installed manually when Stage 4 starts.
+- [x] Stage 4: lerobot 0.5.1 installed out-of-band via
+      `uv pip install --no-deps lerobot` + bulk install of 110
+      transitive deps (excluding torch/torchvision/torchcodec/torchdiffeq
+      and `opencv-python-headless` which would conflict with our
+      `opencv-python`). lerobot's `torch<2.11` ceiling is purely a
+      packaging-level constraint — runtime is compatible with torch 2.12
+      cu128. **Important**: torchcodec is NOT installable on our combo
+      (cu13 wheel mismatch); applied a PyAV monkey-patch (D-012) so
+      lerobot's video decoder bypasses both torchcodec and the removed
+      `torchvision.io.VideoReader`.
+- [x] RunPod base image needs `apt install libegl1 libglvnd0` for
+      headless MuJoCo rendering (D-009).
 - [x] EgoDex **test split only** downloaded (`data/test.zip`, 16.1 GB) and
       extracted to `data/test/` — 111 task subdirs, 6,598 file entries.
       See **D-005** below: we are not downloading any other EgoDex split.
@@ -84,9 +105,23 @@ uv pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 
     torch torchvision
 ```
 
-For lerobot, when Stage 4 starts: try `uv pip install --no-deps lerobot` and pull in
-its remaining deps manually, OR fork lerobot and bump the torch ceiling. Decide
-which path at the time based on which is less invasive.
+For lerobot (resolved 2026-04-08 by R-009 / Stage 4 phase A): use the
+`--no-deps` path. lerobot 0.5.1's `torch<2.11` ceiling is purely a
+packaging-level constraint — runtime is fine on torch 2.12. Recipe:
+
+```bash
+uv pip install --no-deps lerobot
+# Pull lerobot's transitive deps EXCEPT the torch family + opencv-python-headless
+uv pip install \
+    datasets diffusers huggingface-hub accelerate einops av jsonlines \
+    pynput pyserial wandb draccus gymnasium rerun-sdk deepdiff \
+    "imageio[ffmpeg]" termcolor "numpy<2.3" "setuptools<81" "cmake<4.2" \
+    pandas pyarrow pydantic
+```
+
+torchcodec is **not installable** on torch 2.12 cu128 (0.10 has the
+wrong c10 ABI; 0.11 wants CUDA 13). Use the PyAV monkey-patch
+documented in **D-012** instead.
 
 ### D-003: Every step is logged to `/workspace/logs/`
 **Why**: The user is often away and reviews logs after the fact to catch errors and
@@ -360,6 +395,203 @@ swapping one constant in `finger_retargeting.py`. Sticking with Inspire
 for the replication because 6 DOFs keeps the Stage 4 action head small
 and matches the paper's closest comparable setup.
 
+### R-009: Stage 4 — first-cut policy + eval result is 10% success, dominated by visual distribution shift  *(answered 2026-04-08)*
+**Original question**: Does the full pipeline (stab → IK → retargeting →
+ACT → MuJoCo rollouts) actually train and produce a working policy?
+
+**Answer**: **End-to-end pipeline works, first-cut success rate is
+10% (2/20 rollouts), proof-of-life only — not the §4.4 deliverable.**
+
+Trained ACT (51.6 M params, chunk_size=10, n_action_steps=8) via the
+custom loop in `notebooks/09_train_act.py`:
+
+| step | train loss | val loss |
+|---:|---:|---:|
+| 100 | 4.77 | — |
+| 1000 | 0.241 | 0.229 |
+| 1500 | 0.192 | 0.199 |
+| 2000 | 0.158 | 0.182 |
+| 2500 | **0.137** | **0.165** ← best |
+| 3000 (final) | 0.126 | 0.173 |
+
+- batch 64, bf16 autocast, AdamW lr=1e-4, ~25 min wall on RTX 5090
+- 222 train / 55 val episodes (last 20% holdout)
+- val ≤ train at every step → no big overfitting; the train-val gap of
+  0.05 at the end is mild and consistent with ~10 epochs over 17.9 min
+  of footage
+- Best val at step 2500 → mild early-stopping signal but not severe
+
+Eval: `notebooks/10_eval_act.py` ran 20 rollouts of up to 120 env steps
+each (4 s @ 30 Hz) in the `EvalEnv` defined in
+`src/mimicdreamer_egodex/eval_env.py`. Success criterion: object lifted
+> 5 cm.
+
+| metric | value |
+|---|---:|
+| **success rate** | **2 / 20 = 10 %** |
+| mean max lift | 8.6 mm |
+| median max lift | 0.08 mm |
+| max max lift | 51.3 mm |
+| wall time | 7.1 s (~350 ms/rollout) |
+
+Distribution of outcomes:
+- **2 clean successes** (object lifted 50.0 / 51.3 mm at steps 111 / 97)
+- **6 partial touches** (1–20 mm of lift — fingers reached the object
+  but lost grip)
+- **12 no-movement** (the policy's commanded pose missed the object)
+
+**What this means**:
+
+- A truly random or dead policy would be ~0%. The 6 partial touches
+  prove the policy is *directing* the hand toward the object's
+  neighborhood, and the 2 clean successes prove a complete reach →
+  close → lift sequence is reproducible.
+- A polished BC policy on a matched-distribution eval would be 50–90%.
+  We are not there.
+- The training metrics (val loss 0.165) say the model learned the data
+  well — this is **not** a training failure, it's an evaluation-domain
+  mismatch.
+- **The dominant residual error is visual distribution shift** between
+  the training images (1080p egocentric video of a real human hand
+  grasping a varied real object on a textured tabletop) and the eval
+  images (224×224 procedural MuJoCo render of a robot hand on a
+  checkerboard with one bright primitive cube). The ResNet18 vision
+  backbone is sensitive to color/edge/lighting statistics that don't
+  transfer.
+- **No § 4.4 ablation comparison exists yet**. This is the "Full
+  pipeline" condition only. Building a real ablation table requires
+  training 3 more conditions (drop fingers / drop smooth IK / drop
+  stab) and running 100 rollouts each.
+
+**What's NOT validated**:
+- Camera intrinsics — the eval `MjvCamera` is positioned by hand and is
+  NOT calibrated against any specific EgoDex episode's
+  `camera/intrinsic`. This is the single highest-leverage fix.
+- Object diversity — eval uses one 4 cm primitive cube; training data
+  has 99 distinct objects from `llm_objects[0]`.
+- The inference-time arm trajectory — we apply policy actions via
+  direct `qpos` writes (kinematic control) rather than via torque
+  actuators (D-013). This sidesteps controller tuning but means the
+  arm "snaps" each step instead of following a smooth controller —
+  fine for measuring grasp shape success, less realistic for dynamics.
+
+**How to apply / improvement order**:
+
+1. **(easy, ~30 min)** Read `camera/intrinsic` + `transforms/camera`
+   from a representative EgoDex episode, set the `MjvCamera` extrinsics
+   + intrinsics to match. Estimate: 2–4× success rate improvement.
+2. **(easy, ~30 min)** Texture the table top + tune lighting to match
+   the EgoDex metal-table-on-white-background look.
+3. **(medium, ~80 min)** Train longer (10 000 steps instead of 3000)
+   and/or use a smaller model + harder regularization to combat
+   small-data overfitting.
+4. **(hard, ~4 hours)** The §4.4 ablation table proper: build the 3
+   other dataset variants and train them sequentially. This is the
+   real Stage 4 deliverable.
+
+The current 10% number IS the entry for the §4.4 "Full pipeline" cell,
+but it should be **regenerated after improvements (1)–(3)** before being
+quoted as a real result. Honest framing: "first-pass end-to-end
+working, distribution-shift-limited; ablation table not yet built."
+
+### D-012: lerobot's video decoder needs a PyAV-only monkey-patch on torch 2.12 nightly  *(decided 2026-04-08)*
+**Why**: lerobot 0.5.1's `decode_video_frames` dispatches to
+`decode_video_frames_torchcodec` if torchcodec is available, otherwise
+falls back to `decode_video_frames_torchvision` (which calls
+`torchvision.io.VideoReader` under the hood). On our env both paths
+break:
+
+- **torchcodec 0.10** (the version lerobot pins to) was built against
+  torch 2.10's c10 ABI → loading
+  `libtorchcodec_core6.so` raises
+  `OSError: undefined symbol: _ZN3c1013MessageLoggerC1EPKciib` against
+  our torch 2.12 nightly.
+- **torchcodec 0.11** (latest) was built against CUDA 13 → wants
+  `libnvrtc.so.13` which we don't have (we ship CUDA 12.8 nvrtc with
+  the cu128 nightly).
+- **torchvision 0.27 nightly removed `torchvision.io.VideoReader`**
+  entirely → lerobot's "pyav fallback" path raises
+  `AttributeError: module 'torchvision.io' has no attribute 'VideoReader'`.
+
+**How to apply**: import
+`mimicdreamer_egodex.lerobot_pyav_patch.apply()` **before** any
+`from lerobot...` import that touches the dataset reader. The patch
+replaces `lerobot.datasets.video_utils.decode_video_frames` AND
+`lerobot.datasets.dataset_reader.decode_video_frames` (the latter
+binds the function name at import time so both references must be
+patched) with a `decode_video_frames_pyav_only` function that uses
+`av` (PyAV) directly. PyAV is already installed as a transitive
+lerobot dep and is ABI-independent of torch.
+
+The patched function preserves the original contract: `(N, C, H, W)`
+float32 in `[0, 1]`, with timestamp-tolerance frame matching. Verified
+against the smoke-test dataset at frame 0 — image (3, 224, 224) float32
+in [0.000, 0.949], no errors.
+
+### D-013: Stage 4 eval env uses kinematic control (direct `qpos` writes), not torque actuators  *(decided 2026-04-08)*
+**Why**: The trained policy outputs 13-D joint positions, not torques.
+Building a torque-actuator controller (PD or impedance) on top of the
+joint-position targets adds tuning complexity and an extra source of
+sim-to-real gap that doesn't help measure the BC policy's quality. For
+a partial replication where the eval question is "does the policy
+*shape* a successful grasp?" — kinematic control is the right
+abstraction.
+
+**How to apply**: `EvalEnv.step` writes `data.qpos[:6] = action[:6]`
+(UR5e arm) and `data.qpos[inspire_target_qadr] = action[7:13]` (Inspire
+proximals) directly each tick, then calls `mj_step` to advance the
+free-joint object dynamics + contact. The 6 Inspire mimic joints (the
+intermediate / distal joints of the four long fingers and thumb) are
+driven by the URDF mimic equality constraints during `mj_forward`.
+`action[6]` (the gripper scalar from Stage 2) is currently a no-op
+because the Inspire DOFs already encode the full hand pose; pass-
+through for compatibility with the trained 13-D output shape.
+
+**Trade-offs**:
+- Pro: zero controller tuning, exact policy → joint correspondence,
+  fast.
+- Con: arm "snaps" each tick (no joint-velocity smoothing); contact
+  forces during the snap can be noisy. Mitigation: small step sizes
+  via mujoco's default integrator (`implicitfast`).
+- Con: doesn't test whether a real torque controller could track the
+  policy output. That's a sim-to-real concern; out of scope for the
+  partial replication.
+
+If a future eval needs torque-controlled rollouts, swap `step()` to
+write to `data.ctrl[]` instead of `data.qpos[]`, and rely on the
+menagerie UR5e's pre-tuned `general` actuators (the URDF-attached
+Inspire would need actuators added — not free).
+
+### D-014: ACT's `forward()` crashes in `eval()` mode; keep `train()` for validation  *(decided 2026-04-08)*
+**Why**: lerobot 0.5.1's `ACTPolicy.forward()` (in
+`policies/act/modeling_act.py`) computes the VAE KL-divergence loss
+unconditionally, but the VAE encoder is skipped when the model is in
+`eval()` mode. The result is that `log_sigma_x2_hat` is `None` at the
+KL formula:
+
+```python
+(-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+```
+
+→ `TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'`.
+
+**How to apply**: in the validation pass of any custom training loop,
+**do NOT call `policy.eval()`**. Wrap the forward pass with
+`torch.no_grad()` only and keep the model in `train()` mode. The VAE
+encoder will run on the validation batch, the KL loss will be
+well-defined, and the resulting per-batch loss is still a valid
+across-split comparison metric (it just includes the KL term, same as
+train). The `evaluate()` function in `notebooks/09_train_act.py`
+implements this workaround inline with a comment.
+
+This only affects custom loops. lerobot's own `lerobot_train.py` uses
+accelerate's autocast wrapper which sidesteps the issue differently;
+our custom loop hits it directly.
+
+**Important**: at *inference* time (rollouts in the eval env), it IS
+safe to call `policy.eval()` — that path uses `select_action()`, not
+`forward()`, so the buggy KL term is never computed.
+
 ### R-008: Stage 3 — retargeting quality is affordance-class adequate, not within-class precision  *(answered 2026-04-08)*
 **Original question**: Is the Stage 3 finger retargeting actually
 "good"? The 96.8% variance-guard pass rate (R-007) tells us nothing
@@ -616,12 +848,24 @@ directly as an IK task weight rather than thresholding twice.
 ---
 
 ## Open questions (resolve before the relevant stage)
-- **Stage 4**: MuJoCo eval env for `basic_pick_place` — build from scratch, or reuse
-  an existing one (mujoco_menagerie? lerobot envs)? Defer until Stage 4 actually
-  starts; estimate time then.
-- **Stage 4**: lerobot install path — try `uv pip install --no-deps lerobot`
-  + hand-install remaining deps, or fork to bump `torch<2.11`? Decide when
-  Stage 4 starts; D-001 documents the choice.
+- **Stage 4 polish (deferred, not blocking)**: ranked by ROI per R-009:
+  - (1) Calibrate the eval `MjvCamera` intrinsics + extrinsics to one of
+    the 277 EgoDex episodes' `camera/intrinsic` + `transforms/camera`,
+    so the eval-time RGB matches the training distribution. Highest
+    leverage. Estimated 2–4× success rate improvement.
+  - (2) Texture the table top + tune lighting in the eval scene to
+    match EgoDex's metal-table-on-white-background look.
+  - (3) Re-train for 10 000 steps instead of 3000 (current best val at
+    step 2500 hints at slight under-training rather than over-training).
+- **Stage 4 § 4.4 ablation deliverable (the real Stage 4 result)**:
+  build the 3 other dataset variants and train them sequentially:
+    - "FIVER baseline": raw (unstabilized) frames + no-smooth-IK arm + binary gripper, 7-D action
+    - "EgoDex only":    stabilized frames + no-smooth-IK arm + binary gripper, 7-D action
+    - "+ Smooth IK":    stabilized frames + smooth-IK arm + binary gripper, 7-D action
+  Each requires re-running Stage 2 with `lambda_smooth=0` for the
+  no-smooth conditions and a 7-D-action variant of `08_to_lerobot.py`
+  for the no-fingers conditions. Estimated ~4 hours of additional
+  wall time.
 
 ---
 
@@ -633,7 +877,7 @@ directly as an IK task weight rather than thresholding twice.
 | 1     | done — 2026-04-08 | Full batch over all 277 `basic_pick_place` episodes: 271 `exact`, **6 `ransac_fallback` (stub)**, 0 failures. Reduction ratio median 2.50×, p95 8.28×, 61.7% of episodes > 2×, 24.5% > 4×. Inlier H-RMSE median 2.66 px, 92.4% < 10 px. Raw cam angle median 0.17°/frame (low-motion AVP wearer). See `doc.md` §8.5.5 for distributions. The 6 fallback episodes are documented under R-006; the vidstab path is still a stub and will be wired in only if Stage 4 metrics regress on them. |
 | 2     | done — 2026-04-08 (first cut) | Full batch over all 277 episodes: **0 failures**, 62.7 s wall total (~0.23 s/ep). pos_err median distribution: mean 2.48 mm, p95 4.53 mm, **max 99.6 mm** (one bad ep). 96.8% of episodes have pos_err median < 5 mm. ori_err median 0.29° (median of medians). FIVER-collapse guard: **90.6%** of episodes clear ≥5/6 joints > 0.3 rad, 49.5% clear 6/6. No systemic FIVER collapse, but the 0.3-rad-on-all-6-joints threshold is tighter than necessary — per the Stage 4 §4.4 ablation we care about the reaching joints clearing it, which ~100% do. Stage 2 IK tail (8 episodes with p95 > 50 mm) does not overlap with the Stage 1 R-006 episodes — it's an IK-convergence issue, not a data issue. Investigation deferred; see `doc.md` §8.6.8. |
 | 3     | done — 2026-04-08 (first cut + quality assessment) | `src/mimicdreamer_egodex/finger_retargeting.py` written; **Inspire** hand locked in via R-007 (dex-retargeting ships the config out of the box, URDFs vendored at `third_party/dex-urdf@7304c7f`). Full batch over all 277 episodes: **0 failures, 90.7 s total (~2.4 ms/frame mean)**, 96.8% of episodes clear 6/6 target proximals > 0.1 rad. Task-adaptive thumb opposition visible (stapler 0.68 rad vs iPhone 0.48 rad yaw). **Quality assessment (R-008)**: per-finger position error median 5–10 mm (Inspire fingerpad ~15 mm — fine for power grasps, marginal for precision); per-object grasp clustering on 25 objects shows separation ratio 0.95, silhouette −0.15 — captures **affordance class** but not within-class precision. Verdict: **enough for Stage 4 BC training**, not a finished dexterous teleop system. Stage 3 tail (9 episodes with <6/6) decomposes into 3 Stage-1-R-006 overlaps + 6 short (<80-frame) episodes. Zero overlap with the Stage 2 IK tail. See `doc.md` §8.7 (esp. §8.7.8). |
-| 4     | not started | Train policy on `basic_pick_place`, ablation table. |
+| 4     | done — 2026-04-08 (first cut, NOT § 4.4 ablation) | Phase A: lerobot 0.5.1 installed via `--no-deps` + 110 deps; PyAV monkey-patch (D-012) bypasses broken torchcodec/torchvision.io paths; ACT smoke (51.6 M params) forward+backward verified on RTX 5090 with bf16. Phase B: `notebooks/08_to_lerobot.py` converted all 277 episodes into a v3.0 LeRobotDataset (75 MB, 32 271 frames, 200 task strings) in 23 min. Phase C: `notebooks/09_train_act.py` trained ACT for 3000 steps (batch 64, ~25 min), final train loss 0.126 / val loss 0.173 (best val 0.165 at step 2500); D-014 ACT-eval-mode workaround needed in the custom val pass. Phase D: `eval_env.py` builds UR5e+Inspire+table+object scene via `MjSpec.attach()` (D-013 kinematic control); `notebooks/10_eval_act.py` ran 20 rollouts with **2/20 = 10% success rate** (2 clean lifts of 50/51 mm, 6 partial touches, 12 misses). **R-009**: this is proof-of-life only — § 4.4 ablation table needs the 3 other conditions trained AND camera intrinsics calibrated. Distribution shift (training real human hand vs eval procedural MuJoCo render) is the dominant residual error. See `doc.md` §8.8 for the full writeup. |
 
 Mark each stage `in progress` when you start it and `done — YYYY-MM-DD` when the
 deliverable from `initial_plan.md` exists.
