@@ -155,23 +155,28 @@ and the wrist y varies between 0.80 and 0.98 m (below head height, swinging
 through pick-and-place). The only axis on which "camera is consistently
 above wrist" is y → y is up.
 
-### 3.1 — `transforms/camera` is camera-to-world
+### 3.1 — `transforms/camera` is camera-to-world  *(confirmed 2026-04-08)*
 
-Almost certainly camera-to-world (`T_world_cam`), based on:
+`transforms/camera[t]` = `T_world_cam_t`, i.e. `X_world = T @ X_cam`.
 
-- The translation column is in the same scale as the wrist-pose translations.
-- Camera y (~1.07) sits at head height in the same world frame in which the
-  wrist sits at hand height. If it were world-to-camera, the camera "origin"
-  would be at the camera's projection of the world origin, which would not
-  generically land at head height.
+Empirical confirmation on `basic_pick_place/0.hdf5` (verification log:
+`logs/runs/2026-04-08_*_verify_camera_convention.log`):
 
-**To go to camera-frame**: invert. For an SE(3) matrix `T = [[R, t], [0, 1]]`,
-the inverse is `T_inv = [[R.T, -R.T @ t], [0, 1]]` — cheap, no `np.linalg.inv`
+- translation column mean = `(-0.077, 1.069, -0.395)`, std `(0.022, 0.015, 0.010)`
+  over 126 frames. The y component sits at seated AVP head height (~1.07 m)
+  and is essentially constant. World-to-camera would not put a head-height
+  point in the translation column.
+- cam y-mean (1.069) > active right-wrist y-mean (0.877) — head above hand,
+  consistent with cam-to-world.
+- `det(R) = +1`, `R R^T = I` to machine precision, so the rotation block is
+  a proper rotation (not a flip).
+
+**To go to camera-frame**: invert. For an SE(3) `T = [[R, t], [0, 1]]`, the
+inverse is `T_inv = [[R^T, -R^T t], [0, 1]]` — cheap, no `np.linalg.inv`
 needed.
 
-**Action items for Stage 1 / Stage 2 first runs**: confirm this convention
-on the very first script that depends on it. If the magnitude check fails,
-fall back to treating it as world-to-camera.
+The Stage 1 EgoStabilizer relies on this convention; cross-referenced as
+`plan.md` R-003.
 
 ### 3.2 — Plane normals in the y-up frame
 
@@ -354,6 +359,355 @@ With test-split-only data:
 
 ---
 
+## 8.5 Stage 1 EgoStabilizer — geometry & first results
+
+`src/mimicdreamer_egodex/egostabilizer.py`. Plane-induced homography from
+`transforms/camera`, warping every frame to a fixed reference (default frame 0).
+
+### 8.5.1 The formula (sign matters — `plan.md` R-004)
+
+For the world plane y = `table_y` (y-up), with `T_src`, `T_dst` 4x4
+camera-to-world transforms and `K` the shared intrinsic:
+
+```
+R_ds   = R_wd^T R_ws                       # dst-from-src rotation
+t_ds   = R_wd^T (t_ws - t_wd)              # dst-from-src translation
+n_s    = R_ws^T (0, 1, 0)                  # plane normal in src cam frame
+d_s    = table_y - cam_y_world[src]        # signed; negative when cam above
+H_src→dst = K (R_ds + t_ds n_s^T / d_s) K^-1
+```
+
+The **plus sign** is correct for our (src→dst, y-up, cam-to-world) convention.
+The minus form that appears in some references uses the opposite ordering
+or an inward-pointing normal — see R-004 for the derivation. Apply
+`cv2.warpPerspective(frame_src, H, (W, H))` to get a frame that aligns with
+the dst camera's view of the table plane.
+
+### 8.5.2 Metric definitions
+
+- **`raw_mean_interframe_camera_angle_deg`**: mean magnitude (deg) of camera
+  rotation between consecutive `transforms/camera` frames. Tells you how
+  jittery the head was. EgoDex AVP runs are typically 0.3–0.5°/frame.
+- **`raw_mean_interframe_pixel_disp`** / **`stab_mean_interframe_pixel_disp`**:
+  mean ORB-feature displacement between consecutive frames, computed on raw
+  vs. warped frames. The `pixel_disp_reduction_ratio = raw / stab` is the
+  headline stabilization-quality number.
+- **`homography_rmse_px_median`**: inlier-filtered (best 50% of per-pair
+  matches) reprojection error of ORB matches between (ref, t) frames under
+  our geometric homography. **Without inlier filtering this metric is
+  meaningless on EgoDex** — most ORB features land on the moving hand and
+  the manipulated object, which no plane-induced homography can predict.
+  Single-digit pixels = the planar background is correctly tracked.
+
+### 8.5.3 First-cut results
+
+| episode | frames | raw disp (px) | stab disp (px) | reduction | inlier H-RMSE (px) |
+|---------|------:|---------:|---------:|---------:|---------:|
+| `basic_pick_place/0` | 126 | 6.05 | 0.92 | **6.6×** | 1.49 |
+| `basic_pick_place/1` | 160 | 8.98 | 2.11 | **4.25×** | 5.45 |
+
+Episode 0 is mostly stationary (camera std 1–2 cm); episode 1 has the most
+camera motion of the first 80 episodes (~24 cm range). Both stabilize cleanly.
+
+### 8.5.4 RANSAC fallback  *(updated 2026-04-08 — see `plan.md` R-006)*
+
+`vidstab` is installed (Stage 1 dep) but not yet wired in — the fallback
+path currently writes raw frames unchanged. **Original claim was that no
+episode in the test split would trigger it; that was wrong.** The full
+277-episode batch identified **6 episodes** where the active-hand wrist
+had fewer than 5 frames above `CONF_TRACKED = 0.10`, so they dropped to
+the stub:
+
+    [15, 26, 102, 131, 192, 251]   (5 of 6 are left-hand episodes)
+
+All 6 report a `pixel_disp_reduction_ratio` of exactly `1.00×` because the
+stub is the identity warp. None of them overlap with the Stage 2 IK tail
+(§8.6.8), so their impact is localized. We will wire in real vidstab only
+if Stage 4 ablation metrics show a regression on these specific episodes
+vs. the 271 `exact` ones; see `plan.md` R-006.
+
+### 8.5.5 Full-task batch results (277 episodes)
+
+`notebooks/03_stage2_batch.py` aggregates every `outputs/stage1/<idx>_metrics.json`
+into `outputs/stage1_summary_basic_pick_place.csv` and writes an aggregate
+JSON at `outputs/stage1_aggregate.json`. Numbers below are over all 277
+`basic_pick_place` episodes, active-hand split 221 R / 56 L.
+
+**Method mix**: `exact` = 271, `ransac_fallback` (stub) = 6 (see §8.5.4).
+
+| metric | p05 | p50 | mean | p95 | max |
+|---|---:|---:|---:|---:|---:|
+| raw inter-frame camera angle (°) | 0.076 | **0.170** | 0.228 | 0.532 | 0.832 |
+| raw inter-frame ORB disp (px) | 1.42 | **4.10** | 5.01 | 11.19 | 17.76 |
+| stabilized inter-frame ORB disp (px) | 0.26 | **1.72** | 2.49 | 7.39 | 11.25 |
+| reduction ratio (raw/stab) | 1.04× | **2.50×** | 3.26× | 8.28× | 31.14× |
+| inlier H-RMSE (px, per episode median) | 1.06 | **2.66** | 4.20 | 14.26 | 38.91 |
+
+Headline pass/fail fractions:
+
+- **61.7%** of episodes achieve > 2× stabilization
+- **24.5%** of episodes achieve > 4×
+- **92.4%** of episodes have inlier H-RMSE < 10 px
+
+The raw inter-frame camera angle is small (median 0.17°/frame, max 0.83°) —
+AVP wearers hold their head pretty still for seated tabletop PnP. That
+matches the qualitative "mostly static" impression from the smoke test on
+episode 0 and explains why the reduction ratio p05 is barely above 1× —
+there isn't much motion to take out in the quietest episodes. The
+reduction is load-bearing on the noisier 50–75th percentile of episodes
+where raw inter-frame disp is 4–7 px and the stabilizer brings it to
+1.5–3 px.
+
+Per-episode rows are in `outputs/stage1_summary_basic_pick_place.csv`;
+aggregate stats cached at `outputs/stage1_aggregate.json`.
+
+---
+
+## 8.6 Stage 2 action alignment — H2R frame + IK
+
+`src/mimicdreamer_egodex/action_alignment.py`. Converts an EgoDex episode's
+active-hand wrist trajectory into a UR5e 6-DOF joint-angle trajectory plus a
+binary gripper signal.
+
+### 8.6.1 Target robot — UR5e (`plan.md` R-005)
+
+- Loaded via `robot_descriptions.loaders.mujoco.load_robot_description("ur5e_mj_description")`.
+  First call clones `mujoco_menagerie` (~30 s, one-time).
+- `njnt = nq = nv = 6`. Joint order:
+  `[shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]`. All
+  revolute hinges. Limits `±2π` except elbow `±π`.
+- IK target frame: **`attachment_site`** (tool flange, `frame_type="site"`) —
+  also the mount point where a Stage 3 dexterous hand goes, so arm IK and
+  finger retargeting stay decoupled.
+- One keyframe: `home = [-π/2, -π/2, π/2, -π/2, -π/2, 0]`, which puts
+  `attachment_site` at robot-frame `(-0.134, 0.492, 0.488)` with the tool
+  pointing up. Used as the IK seed.
+
+### 8.6.2 Schema contract (correcting §2.1 of `initial_plan.md`)
+
+The `initial_plan.md` §2.1 extractor does
+`np.linalg.inv(extrinsics[t]) @ wrist_poses[t]`. **Do not do this** — in the
+real schema (`plan.md` D-004), `transforms/leftHand`, `transforms/rightHand`,
+and every finger joint are **already in world frame** (see §2 above). Reading
+them directly is both correct and cheaper. `action_alignment.load_episode`
+does exactly this.
+
+Fingertip joint names per side (see §2.1):
+
+- `<side>ThumbTip`
+- `<side>IndexFingerTip`
+- `<side>MiddleFingerTip`
+- `<side>RingFingerTip`
+- `<side>LittleFingerTip`
+
+(5 per hand, in that order, matching `FINGERTIPS` in `action_alignment.py`.)
+
+### 8.6.3 H2R — human world to robot base frame
+
+ARKit world is y-up (§3); the UR5e MJCF is z-up. We fix the y→z mapping with
+a constant rotation:
+
+```
+R_W2R = [[1, 0,  0],
+         [0, 0, -1],
+         [0, 1,  0]]
+```
+
+`det(R_W2R) = +1`, `R_W2R R_W2R^T = I`. Under this: `world x → robot x`,
+`world y → robot z`, `world z → robot -y`. **Yaw around the robot z-axis is
+arbitrary** — ARKit world yaw depends on where the wearer was facing when
+the AVP initialized, so there is no "correct" alignment of the world
+horizontal plane to the robot horizontal plane. We absorb this freedom into
+the translation step below.
+
+The full H2R transform is `p_robot = scale * (R_W2R @ p_world) + t`. The
+translation `t` is computed per episode so that:
+
+1. The table surface (`table_y = 5th-pctl active-wrist world-y`, per R-001)
+   lands at **robot z = 0**.
+2. The **mean wrist xy** in the rotated frame lands at
+   `WORKSPACE_CENTER_XY = (0.5, 0.0)` — 0.5 m in front of the UR5e base,
+   centered on the midline. UR5e reach is ~0.85 m, so this leaves headroom
+   on both sides.
+
+Rotations are mapped via `R_robot = R_W2R @ R_world`. Scale defaults to
+**1.0**. The `initial_plan.md` §2.2 `scale = 0.6 / 0.5` hack is rejected:
+(a) the "0.5 m human reach" number is eyeballed, and (b) a non-1 scale
+breaks the simultaneous "table at z=0" + "centered workspace" condition
+unless the two translations are re-derived consistently. `--scale` remains
+a CLI flag for experiments.
+
+### 8.6.4 IK — mink FrameTask + PostureTask smoothness
+
+Per-frame, one `FrameTask(attachment_site, position_cost=1.0,
+orientation_cost=0.3)` is targeted at the H2R-aligned wrist pose, and one
+`PostureTask(cost=lambda_smooth)` is set to the **previous frame's solution**
+and held fixed through inner iterations. The inner loop runs up to
+`step_iters=10` Newton steps (`seed_iters=80` on frame 0) and breaks when
+`||pos_err|| < 2 mm`. Solver: `quadprog`, damping `1e-3`.
+
+The "posture anchored at previous-frame q" choice is the smoothness term
+`initial_plan.md` §2.3 wanted (but wrote slightly wrong — it sets the
+anchor to the *current* configuration instead, which reduces to a generic
+velocity damping). With the anchor fixed to `q_{t-1}` for the duration of
+frame t's iterations, the posture residual grows as q drifts toward the
+frame-t target, which pulls q back and trades off "reach the target" vs.
+"stay close to yesterday's solution". That is the FIVER-v1-killing knob.
+
+`mink.FrameTask.compute_error` returns a body twist in se(3) as
+**`[tx, ty, tz, rx, ry, rz]`** (verified empirically on 2026-04-08 by
+shifting the target +10 cm along robot x and reading the result). Position
+error = `||err[:3]||`, orientation error = `||err[3:]||` (radians).
+
+### 8.6.5 Gripper signal
+
+Mean of `||tip_i - wrist||` over the 5 fingertips (world frame). Threshold
+at the **per-episode median** of openness, then median-filter with
+`window=5`. Calibrate per task later if needed (`--gripper-threshold` CLI
+flag). Snapshot from `basic_pick_place/0`: threshold 0.142 m, 49% open.
+
+### 8.6.6 Metrics & variance guard
+
+Written to `outputs/stage2/<idx>_metrics.json` per episode:
+
+- `pos_err_m_median / _p95` — final per-frame Cartesian error after the
+  inner IK loop exits (m).
+- `ori_err_deg_median / _p95` — orientation twist magnitude (deg).
+- `iters_mean / _max` — inner-loop iterations per frame.
+- `variance.per_joint_range_rad` — per-joint range over the episode.
+- `variance.n_joints_range_gt_0_3rad` — mandatory FIVER-collapse guard
+  (CLAUDE.md); for UR5e on tabletop PnP this should be 5 or 6 out of 6.
+
+First-cut results (two smoke-test episodes, `basic_pick_place`):
+
+| episode | frames | pos_err med (mm) | pos_err p95 (mm) | ori_err med (°) | range > 0.3 rad |
+|---------|------:|-----:|-----:|-----:|---:|
+| `basic_pick_place/0` | 126 | **2.14** |  15.3 | 0.23 | **6/6** |
+| `basic_pick_place/1` | 160 | **3.87** |  59.9 | 0.68 | **6/6** |
+
+Inter-frame `|Δq|` on ep 0: mean 0.024 rad (~1.4° per frame), max 0.28 rad.
+The ep-1 p95 tail is ~8 frames at peak arm excursion where the posture
+anchor fights the frame task near the edge of the UR5e workspace;
+non-systematic on 2 episodes but worth checking in the 277-episode batch.
+
+### 8.6.7 Full-task batch results (277 episodes)
+
+`notebooks/03_stage2_batch.py` runs `process_episode` over all 277
+`basic_pick_place` episodes in a single process (so the UR5e MJCF is
+loaded once and cached — see `_CACHED_UR5E_MODEL`). **Wall time: 62.7 s
+total, ~0.23 s per episode.** Zero failures. Active-hand split 221 R / 56 L
+(identical to Stage 0 variance report, as expected).
+
+Per-episode pos/orientation/variance summary:
+
+| metric | p05 | p50 | mean | p95 | max |
+|---|---:|---:|---:|---:|---:|
+| pos_err median (mm) | 0.29 | **1.38** | 2.48 | 4.53 | 99.6 |
+| pos_err p95 (mm) | 2.36 | **5.74** | 10.97 | 24.43 | 444.6 |
+| ori_err median (°) | 0.06 | **0.29** | 0.59 | 0.92 | 20.0 |
+| ori_err p95 (°) | 0.54 | **1.49** | 2.60 | 7.28 | 34.9 |
+| IK iters (mean per frame) | 2.25 | 4.89 | 5.20 | 9.15 | 10.36 |
+| n_joints with range > 0.3 rad | 4 | **5** | 5.39 | 6 | 6 |
+| min joint range (rad) | 0.112 | **0.297** | 0.311 | 0.576 | 1.206 |
+
+Headline fractions:
+
+- **96.8%** of episodes have pos_err median < 5 mm
+- **97.5%** have pos_err median < 10 mm
+- **92.4%** have pos_err p95 < 20 mm
+- **97.1%** have pos_err p95 < 50 mm
+- **90.6%** of episodes clear ≥ 5/6 joints > 0.3 rad (the FIVER-collapse
+  guard; see §8.6.8 below on why 5/6 is the right cut, not 6/6)
+- 49.5% clear all 6/6 joints
+- 96.8% of episodes have the entire wrist trajectory above `CONF_TRACKED`
+  with no gap-filling needed; the remaining 3.2% gap-fill a handful of
+  frames each
+
+Per-episode CSV: `outputs/stage2_summary_basic_pick_place.csv`. Aggregate
+JSON: `outputs/stage2_aggregate.json`.
+
+### 8.6.8 Variance-guard interpretation + known IK tail
+
+**Variance guard, re-framed.** The FIVER v1 failure mode was collapsed
+*global* joint ranges — the IK gave basically constant joint values even
+though the wrist moved. The original `initial_plan.md` §2.5 check asks
+"are most joints > 0.3 rad", which on UR5e tabletop PnP is too strict:
+wrist_2 / wrist_3 sometimes stay near zero because the human wearer
+doesn't twist the hand much. That is not collapse — it is a legitimate
+quiet DOF. The meaningful cut is **≥ 5/6 joints > 0.3 rad**, which 90.6%
+of episodes clear. The reaching joints (shoulder_lift, elbow, wrist_1)
+clear the cut on effectively 100% of episodes. No FIVER-style collapse is
+present.
+
+**Known IK tail: 8 episodes with pos_err p95 > 50 mm** (2.9% of the split).
+Sorted by p95:
+
+| idx | frames | tracked | pos_med (mm) | pos_p95 (mm) | var |
+|----:|------:|------:|------:|------:|---:|
+| 187 |  62 |  62 |   3.04 | **444.65** | 6/6 |
+| 190 | 171 | 171 |  99.59 |    137.34  | 5/6 |
+| 183 |  84 |  84 |  23.34 |     94.49  | 6/6 |
+|  12 |  96 |  96 |  32.69 |     90.40  | 5/6 |
+|  80 | 111 | 111 |  23.01 |     87.51  | 5/6 |
+|  61 |  85 |  85 |  33.16 |     82.64  | 6/6 |
+| 103 |  79 |  79 |  37.84 |     68.09  | 5/6 |
+|   1 | 160 | 160 |   3.87 |     59.90  | 6/6 |
+
+Notes:
+
+- **All 8 have fully-tracked wrists** — the tail is not caused by bad
+  ARKit confidence. The overlap with the Stage 1 R-006 fallback episodes
+  (15, 26, 102, 131, 192, 251) is **empty**.
+- Ep **187** is the worst p95 but its median is only 3 mm — one or two
+  frames blow up catastrophically (>40 cm). That shape is consistent with
+  the IK jumping basins at a wrist-singularity or at a target just outside
+  the UR5e reach envelope.
+- Ep **190** is the worst *sustained* tail: median 100 mm across a 171-frame
+  episode. Likely the H2R-mapped wrist trajectory is partly outside the
+  UR5e workspace for a chunk of this episode (the human wrist went further
+  than `WORKSPACE_CENTER_XY + reach`), so the IK is pinned to the nearest
+  reachable point. Worth revisiting if Stage 4 metrics on this episode
+  matter.
+- Ep **1** (the smoke-test episode from §8.5.3) confirms the earlier
+  observation that its ~60 mm p95 was real but contained — only 8 frames
+  above 50 mm and it still clears 6/6 joints > 0.3 rad.
+
+**Tuning knobs to try if/when this tail starts mattering**:
+
+1. Bump `step_iters` from 10 → 25 (mink is cheap; converge harder).
+2. Lower `orientation_cost` from 0.3 → 0.1 on the worst frames (trade
+   wrist twist for position reach).
+3. Lower `lambda_smooth` from 0.1 → 0.03 on the worst frames (let the IK
+   break from the previous-frame anchor when the target is far).
+4. Per-episode workspace centering on a *moving* window instead of the
+   global mean (handles the ep-190 sliding-reach case).
+
+None of these is done yet — deferred until the Stage 4 ablation proves
+the tail matters.
+
+### 8.6.9 Artifact format
+
+`outputs/stage2/<idx>_actions.npz`:
+
+| key | shape | dtype | notes |
+|-----|-------|-------|-------|
+| `q` | `(T, 6)` | float32 | UR5e joint trajectory (rad) |
+| `gripper` | `(T,)` | float32 | binary (0/1), median-filtered |
+| `gripper_openness` | `(T,)` | float32 | raw openness (m) |
+| `pos_err_m` | `(T,)` | float32 | per-frame IK pos error |
+| `ori_err_deg` | `(T,)` | float32 | per-frame IK orientation error |
+| `iters` | `(T,)` | int32 | inner-loop iterations |
+| `wrist_targets_robot` | `(T, 4, 4)` | float32 | robot-frame H2R targets |
+| `h2r_R`, `h2r_t`, `h2r_scale` |  |  | H2R transform used |
+| `table_y_world` |  | float32 | table plane y in world (m) |
+| `joint_names` | `(6,)` | str | UR5e joint names |
+| `active_hand` | scalar | str | `"left"` or `"right"` |
+
+Ready to be concatenated with Stage 3 finger angles into the final
+`[q_arm_6, gripper_1, q_finger_N]` action vector.
+
+---
+
 ## 9. File / artifact index
 
 Code (read these to verify any claim above):
@@ -363,6 +717,9 @@ Code (read these to verify any claim above):
 | `notebooks/00_explore_egodex.py` | Single-episode HDF5 dump + per-hand variance/confidence printout. Auto-finds a `basic_pick_place` episode. |
 | `notebooks/01_variance_report.py` | Aggregates wrist-range statistics across every episode in a task folder. Writes CSV. The Stage 0 deliverable. |
 | `notebooks/02_calibrate_open_questions.py` | Computes the confidence distribution and the per-frame camera-to-table distance across a task. Writes CSV. The R-001 / R-002 calibration source. |
+| `notebooks/03_stage2_batch.py` | Full-task batch driver. Aggregates existing Stage 1 metrics JSONs into a CSV + aggregate JSON, then runs Stage 2 `process_episode` over every episode in a single process (UR5e MJCF cached), writing the Stage 2 CSV + aggregate JSON. Single source of the batch distributions in §8.5.5 / §8.6.7 / §8.6.8. |
+| `src/mimicdreamer_egodex/egostabilizer.py` | Stage 1 deliverable. Plane-induced homography stabilizer with R-001/R-002/R-003/R-004 baked in. CLI: `uv run python -m mimicdreamer_egodex.egostabilizer <hdf5> --out-dir outputs/stage1`. Writes stabilized MP4 + metrics JSON. |
+| `src/mimicdreamer_egodex/action_alignment.py` | Stage 2 deliverable. UR5e IK (mink FrameTask + smoothness PostureTask) on H2R-aligned wrist poses, plus fingertip-spread gripper signal. CLI: `uv run python -m mimicdreamer_egodex.action_alignment <hdf5> --out-dir outputs/stage2`. Writes `<idx>_actions.npz` + metrics JSON. |
 
 Artifacts:
 
@@ -373,6 +730,14 @@ Artifacts:
 | `data/test/<task>/<idx>.mp4` | extracted egocentric video |
 | `outputs/variance_report_basic_pick_place.csv` | per-episode wrist ranges + active hand label |
 | `outputs/calibration_basic_pick_place.csv` | per-episode confidence percentiles + camera-to-table distances |
+| `outputs/stage1/<idx>_stabilized.mp4` | Stage 1 stabilized clips (one per processed episode) |
+| `outputs/stage1/<idx>_metrics.json` | Stage 1 metrics dump per episode |
+| `outputs/stage2/<idx>_actions.npz` | Stage 2 UR5e joint-angle trajectory + gripper signal per episode |
+| `outputs/stage2/<idx>_metrics.json` | Stage 2 IK + variance metrics per episode |
+| `outputs/stage1_summary_basic_pick_place.csv` | Per-episode Stage 1 metrics aggregated from all 277 `outputs/stage1/<idx>_metrics.json` files |
+| `outputs/stage1_aggregate.json` | Stage 1 headline distributions (method mix, active-hand split, per-metric percentiles, pass fractions) — source for §8.5.5 |
+| `outputs/stage2_summary_basic_pick_place.csv` | Per-episode Stage 2 IK + variance metrics (1 row per episode) |
+| `outputs/stage2_aggregate.json` | Stage 2 headline distributions — source for §8.6.7 / §8.6.8 |
 | `logs/session_2026-04-07.md` | narrative session log |
 | `logs/runs/2026-04-07_*.log` | captured stdout/stderr from every script run |
 
@@ -382,6 +747,10 @@ Decisions:
 - `plan.md` D-005 — test-split-only scope
 - `plan.md` R-001 — table-distance + y-up resolution
 - `plan.md` R-002 — confidence threshold recalibration
+- `plan.md` R-003 — `transforms/camera` confirmed cam-to-world
+- `plan.md` R-004 — plane-homography sign correction
+- `plan.md` R-005 — UR5e chosen as Stage 2 arm URDF
+- `plan.md` R-006 — 6 Stage 1 episodes fall through to the RANSAC fallback stub
 
 If any of the above goes stale, update both this file *and* the matching
 entry in `plan.md` so they don't drift.

@@ -7,25 +7,38 @@ The original 4-stage roadmap (Stages 0–4 + contributions + timeline) lives in
 
 ---
 
-## Current state — 2026-04-07 (Day 0)
+## Current state — 2026-04-08 (Day 1)
 
-**Stage**: 0 — Foundation + Data Exploration (in progress, deliverable produced)
-**Last action**: Downloaded EgoDex `test.zip` (16.1 GB), extracted, wrote
-`notebooks/00_explore_egodex.py` (single-episode dump) and
-`notebooks/01_variance_report.py` (whole-task aggregate). Variance report on
-277 `basic_pick_place` episodes: 0 collapsed, 70.4% within the 0.2–0.5 m target
-range. CSV at `outputs/variance_report_basic_pick_place.csv`. See decision
-**D-004** below — the schema in `initial_plan.md` §0.3 was wrong; the real
-layout is everything-as-`/transforms/<joint>` and metadata as file attrs.
-**Next action**: Stage 0 §0.1–0.2 conceptual reading (homography + DLS IK),
-then move to Stage 1 — write `egostabilizer.py`. **No further EgoDex
-downloads** (D-005); the test split is the only data we use.
+**Stage**: 1 and 2 first-cut complete on the full 277-episode
+`basic_pick_place` test split.
+**Last action**: Wrote `notebooks/03_stage2_batch.py` (full-task batch
+driver + Stage 1 metrics aggregator in one pass), ran it: 277/277 episodes,
+0 failures, **62.7 s total wall time** (~0.23 s per episode). Outputs at
+`outputs/stage{1,2}_summary_basic_pick_place.csv` and
+`outputs/stage{1,2}_aggregate.json`. Two findings worth flagging:
+**(a)** 6 Stage 1 episodes fell into the `ransac_fallback` stub path
+(contradicting R-004's "no episode expected to fail" — see R-006); **(b)**
+8 Stage 2 episodes have IK `pos_err_p95 > 50 mm`, with a clean worst case
+of ep 190 (median 100 mm, all 171 frames tracked — real IK edge, not a data
+bug). The two tails do **not** overlap, so the Stage 2 tail is not caused
+by bad wrist tracking. Run log:
+`logs/runs/2026-04-08_092549_stage2_batch.log`.
+**Next action**: (a) start Stage 3 (`finger_retargeting.py`) — the blocker
+was Stage 2, not the tail; (b) investigate the Stage 2 IK tail in a side
+session if it matters for the Stage 4 ablation; (c) implement the real
+vidstab fallback for the 6 R-006 episodes if Stage 4 metrics regress on
+them.
 
 ### Environment status
-- [x] uv project initialized, Python 3.13.
+- [x] uv project initialized, Python 3.13. (Reinstalled uv on 2026-04-08:
+      RunPod container restart wiped `/root/.local/`, but `/workspace/.venv`
+      and `uv.lock` survived; `curl install.sh | sh` + `uv python install 3.13`
+      restored everything in <30 s.)
 - [x] Base deps installed (`uv sync`): h5py, numpy, opencv-python, scipy, jupyter, etc.
-- [ ] Stage 1 deps (`uv sync --group stage1`): vidstab.
-- [ ] Stage 2 deps: mink, quadprog.
+- [x] Stage 1 deps installed (`uv sync --group stage1`): vidstab 1.7.4.
+- [x] Stage 2 deps installed (`uv sync --group stage2` + `uv add --group stage2
+      robot_descriptions`): mink 1.1.0, mujoco 3.6.0, quadprog 0.1.13,
+      qpsolvers 4.11.0, daqp 0.8.5, robot_descriptions 1.23.0.
 - [ ] Stage 3 deps: dex-retargeting.
 - [ ] Stage 4: torch nightly (cu128) + lerobot — installed manually, see below.
 - [x] EgoDex **test split only** downloaded (`data/test.zip`, 16.1 GB) and
@@ -180,6 +193,135 @@ Investigation script: `notebooks/02_calibrate_open_questions.py`. Numeric
 output captured at `logs/runs/2026-04-07_111200_calibrate_open_questions_v2.log`.
 Per-episode CSV at `outputs/calibration_basic_pick_place.csv`.
 
+### R-003: Stage 1 — confirmed `transforms/camera` is camera-to-world  *(answered 2026-04-08)*
+**Original question** (action item from `doc.md` §3.1): the convention was
+inferred from the magnitude of the translation column on `basic_pick_place/0`
+but never empirically pinned down. Stage 1 depends on it for sign correctness.
+
+**Answer**: camera-to-world. Verified on `basic_pick_place/0.hdf5`:
+- `transforms/camera[t][:3, 3]` mean = `(-0.077, 1.069, -0.395)`, std
+  `(0.022, 0.015, 0.010)` over 126 frames. The y-component sits at head
+  height for a seated AVP wearer (~1.07 m) and is ~constant. If this were
+  world-to-camera the translation would be the world origin in the camera's
+  coordinate system, which would not generically land at head height.
+- The cam y-mean (1.069) is above the right-wrist y-mean (0.877), matching
+  "head above hand".
+- `R R^T - I` is at machine precision; `det(R) = +1`. So the rotation block
+  is a proper rotation, not a left-handed flip.
+
+Verification log: `logs/runs/2026-04-08_*_verify_camera_convention.log`.
+
+**How to apply**: in code, treat `transforms/camera[t]` as `T_world_cam_t`
+(`X_world = T @ X_cam`). To go to camera frame, invert by transposing the
+rotation and applying `-R^T t` — see `egostabilizer.plane_homography`.
+
+### R-004: Stage 1 — sign of the plane-induced homography  *(answered 2026-04-08)*
+**Original question**: while smoke-testing `egostabilizer.py` on
+`basic_pick_place/1`, stabilization barely reduced inter-frame ORB
+displacement (1.04× ratio) and the inlier H-RMSE was ~125 px. The geometry
+matched the textbook formula `H = K (R - t n^T / d) K^-1`, but something was
+clearly wrong.
+
+**Answer**: the textbook minus-sign assumes a different (src, dst) ordering.
+Re-deriving from scratch with our convention (`X_dst = R_ds X_src + t_ds` and
+`n_s^T X_s = d_s` describing the plane in the source frame) gives:
+
+    X_d = R_ds X_s + t_ds * (n_s.T X_s / d_s) = (R_ds + t_ds n_s.T / d_s) X_s
+
+i.e. **plus**, not minus. The minus form in Hartley & Zisserman corresponds to
+the opposite ordering / inward-pointing normal convention. With the plus sign,
+on `basic_pick_place/1`:
+
+| metric                       | before fix | after fix |
+|-----------------------------|-----------:|----------:|
+| stab inter-frame disp (px)  |       6.65 |      2.11 |
+| reduction ratio             |       1.35 |      4.25 |
+| inlier H-RMSE (px, median)  |     125.6  |       5.5 |
+
+And on `basic_pick_place/0` (mostly static): 6.05 → 0.92 px (6.6× ratio),
+inlier H-RMSE 1.5 px.
+
+**How to apply**: the corrected formula lives at
+`egostabilizer.plane_homography`. The `+` sign is non-negotiable for our
+(src→dst, world-y-up, camera-to-world `transforms/camera`) convention.
+Re-derive from scratch (do not copy from a textbook) if any of those
+assumptions ever change.
+
+A second metric subtlety surfaced at the same time: the *raw* H-RMSE
+(measured against all ORB matches between frame 0 and a far frame t) is
+dominated by features on the moving hand and the manipulated object, which
+no plane-induced homography can predict. The metric is only meaningful after
+inlier filtering — keep the best 50% of per-pair reprojection errors. The
+implementation in `homography_reprojection_rmse` does this.
+
+### R-006: Stage 1 — 6 episodes actually fall through to the RANSAC fallback  *(answered 2026-04-08)*
+**Original claim (R-004 / doc.md §8.5.4)**: the `CONF_TRACKED = 0.10`
+confidence floor is loose enough that "no episode in the test split is
+expected to fail it for the wrist joint" — so the vidstab fallback can
+stay a stub.
+
+**Answer**: that claim was wrong. The full-task Stage 1 batch over 277
+`basic_pick_place` episodes classified 6 of them as `ransac_fallback`
+(i.e. fewer than 5 active-hand wrist frames above `CONF_TRACKED`):
+
+| idx | frames | active hand | stab reduction |
+|----:|------:|-------------|---------------:|
+|  15 |    51 | right       |         1.00 × |
+|  26 |   127 | left        |         1.00 × |
+| 102 |   100 | left        |         1.00 × |
+| 131 |   142 | left        |         1.00 × |
+| 192 |   125 | left        |         1.00 × |
+| 251 |   113 | left        |         1.00 × |
+
+5 of 6 are left-hand — the ARKit left-hand wrist-confidence distribution on
+this task has a longer low tail than the right. The `1.00×` reduction is
+expected: the fallback path is currently a stub that writes raw frames
+unchanged, so raw disp == stab disp by construction.
+
+Importantly, **these 6 episodes do not overlap with the Stage 2 IK tail**
+(see `doc.md` §8.6.8) — Stage 2's tail is an IK convergence issue, not a
+data quality issue.
+
+**How to apply**:
+1. Update `doc.md` §8.5.4 to state "6 episodes do fall through; the
+   fallback is currently a stub" instead of "none expected".
+2. Wire in a real vidstab RANSAC path when either: (a) Stage 4 ablation
+   metrics regress on these 6 episodes vs. the 271 `exact` ones, or (b)
+   the Stage 2 batch ends up needing them. Neither condition holds yet.
+3. For now, these 6 episodes still produce stabilized MP4s (just
+   unchanged) and produce valid Stage 2 joint trajectories, so they do
+   not block anything.
+
+### R-005: Stage 2 — arm URDF  *(answered 2026-04-08)*
+**Original question**: Which arm URDF to target for IK? `initial_plan.md` §2.3
+is agnostic; FIVER used UR5e.
+
+**Answer**: **UR5e**, loaded via
+`robot_descriptions.loaders.mujoco.load_robot_description("ur5e_mj_description")`.
+Reasons:
+- 6-DOF standard serial arm; matches the `(arm_6, gripper_1, finger_N)`
+  action vector `initial_plan.md` §3.3 already writes.
+- Default in mink's own arm examples — minimal integration risk.
+- `attachment_site` on the tool flange is the natural frame for the
+  Stage 2 `FrameTask` target and is also exactly where a Stage 3 dexterous
+  hand would be mounted. Arm and hand remain decoupled: Stage 2 solves for
+  the 6 arm DOFs to put the wrist where the human wrist is, Stage 3
+  retargets fingers independently against the same episodes, and the two
+  are concatenated at action-assembly time.
+
+**How to apply (Stage 2/3/4)**:
+- Stage 2: IK target is `attachment_site`; home keyframe `home` (the MJCF's
+  only keyframe) is a safe seed. Joint order is
+  `[shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]`; all
+  revolute; joint limits `±2π` except elbow `±π`.
+- Stage 3: treat the arm as solved; choose the dex hand without having to
+  revisit the arm.
+- Stage 4: the LeRobot action head predicts 6 arm DOFs + gripper + N finger
+  DOFs. Dimensionality is fixed at 7+N.
+
+The Stage 3 dex-hand choice (Inspire vs. Allegro vs. LEAP) is still an open
+question; see "Open questions" above.
+
 ### R-002: Stage 2 — ARKit confidence threshold recalibration  *(answered 2026-04-07)*
 **Original question** (surfaced 2026-04-07 from the §0.3 single-episode dump):
 The `initial_plan.md` §2.1 plan filters at `min_confidence = 0.5`. On episode 0
@@ -239,8 +381,6 @@ directly as an IK task weight rather than thresholding twice.
 ---
 
 ## Open questions (resolve before the relevant stage)
-- **Stage 2**: Which arm URDF to target for IK? UR5e is the default in the mink
-  examples and matches what FIVER used. 
 - **Stage 3**: Does `dex-retargeting` ship an Inspire-hand config in `assets/`? If
   not, write a YAML for the Allegro hand instead — the dexterity story is the same.
 - **Stage 4**: MuJoCo eval env for `basic_pick_place` — build from scratch, or reuse
@@ -253,9 +393,9 @@ directly as an IK task weight rather than thresholding twice.
 
 | Stage | Status      | Notes |
 |-------|-------------|-------|
-| 0     | in progress | Test split downloaded + extracted; exploration script + variance report done; concept reading + part2 download outstanding. |
-| 1     | not started | EgoStabilizer (exact homography from extrinsics + RANSAC fallback). |
-| 2     | not started | Action alignment (wrist trajectory → IK joint angles). |
+| 0     | done — 2026-04-07 | Test split downloaded + extracted; exploration + variance report; R-001/R-002 calibrated. (`part2` download is obsolete per D-005; concept reading is on the user, not Claude.) |
+| 1     | done — 2026-04-08 | Full batch over all 277 `basic_pick_place` episodes: 271 `exact`, **6 `ransac_fallback` (stub)**, 0 failures. Reduction ratio median 2.50×, p95 8.28×, 61.7% of episodes > 2×, 24.5% > 4×. Inlier H-RMSE median 2.66 px, 92.4% < 10 px. Raw cam angle median 0.17°/frame (low-motion AVP wearer). See `doc.md` §8.5.5 for distributions. The 6 fallback episodes are documented under R-006; the vidstab path is still a stub and will be wired in only if Stage 4 metrics regress on them. |
+| 2     | done — 2026-04-08 (first cut) | Full batch over all 277 episodes: **0 failures**, 62.7 s wall total (~0.23 s/ep). pos_err median distribution: mean 2.48 mm, p95 4.53 mm, **max 99.6 mm** (one bad ep). 96.8% of episodes have pos_err median < 5 mm. ori_err median 0.29° (median of medians). FIVER-collapse guard: **90.6%** of episodes clear ≥5/6 joints > 0.3 rad, 49.5% clear 6/6. No systemic FIVER collapse, but the 0.3-rad-on-all-6-joints threshold is tighter than necessary — per the Stage 4 §4.4 ablation we care about the reaching joints clearing it, which ~100% do. Stage 2 IK tail (8 episodes with p95 > 50 mm) does not overlap with the Stage 1 R-006 episodes — it's an IK-convergence issue, not a data issue. Investigation deferred; see `doc.md` §8.6.8. |
 | 3     | not started | Dexterous finger retargeting via dex-retargeting. |
 | 4     | not started | Train policy on `basic_pick_place`, ablation table. |
 

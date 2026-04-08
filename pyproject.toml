@@ -29,6 +29,7 @@ stage1 = [
 stage2 = [
     "mink>=0.0.6",
     "quadprog>=0.1.13",
+    "robot-descriptions>=1.23.0",
 ]
 
 # Stage 3 — Dexterous finger retargeting

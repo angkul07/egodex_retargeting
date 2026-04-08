@@ -106,7 +106,13 @@ file paths and dataset IDs touched, hyperparameters.
 - **HDF5 schema**: every joint is `transforms/<jointName>` `(T,4,4)` with confidence
   at `confidences/<jointName>` `(T,)`. Language metadata is on file-level attrs,
   not a `/language/annotation` dataset. See `doc.md` §2.
+- **Joint poses are world-frame, not camera-frame.** `transforms/<joint>` are
+  already in the ARKit world frame. Do NOT invert `transforms/camera` onto
+  them — `initial_plan.md` §2.1 is wrong on this. See `plan.md` D-004.
 - **Confidence thresholds**: `0.10` for hard reject (untracked floor),
   `0.50` only as a *weight*, never a hard cut. See `doc.md` §5.
+- **Arm target = UR5e** (`robot_descriptions.ur5e_mj_description`),
+  end-effector frame = `attachment_site`. Decoupled from the Stage 3
+  dexterous hand. See `plan.md` R-005.
 - Always write a "variance check" output when producing trajectories — the FIVER v1
   failure mode (collapsed joint ranges) is the thing we're explicitly trying to avoid.

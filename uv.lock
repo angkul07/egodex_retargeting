@@ -1607,6 +1607,7 @@ stage1 = [
 stage2 = [
     { name = "mink" },
     { name = "quadprog" },
+    { name = "robot-descriptions" },
 ]
 stage3 = [
     { name = "dex-retargeting" },
@@ -1637,6 +1638,7 @@ stage1 = [{ name = "vidstab", specifier = ">=1.7" }]
 stage2 = [
     { name = "mink", specifier = ">=0.0.6" },
     { name = "quadprog", specifier = ">=0.1.13" },
+    { name = "robot-descriptions", specifier = ">=1.23.0" },
 ]
 stage3 = [{ name = "dex-retargeting", specifier = ">=0.4.5" }]
 stage4 = [
@@ -2445,6 +2447,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2c/06/37c1a5557acf449e8e406a830a05bf885ac47d33270aec454ef78675008d/rfc3987_syntax-1.1.0.tar.gz", hash = "sha256:717a62cbf33cffdd16dfa3a497d81ce48a660ea691b1ddd7be710c22f00b4a0d", size = 14239, upload-time = "2025-07-18T01:05:05.015Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7e/71/44ce230e1b7fadd372515a97e32a83011f906ddded8d03e3c6aafbdedbb7/rfc3987_syntax-1.1.0-py3-none-any.whl", hash = "sha256:6c3d97604e4c5ce9f714898e05401a0445a641cfa276432b0a648c80856f6a3f", size = 8046, upload-time = "2025-07-18T01:05:03.843Z" },
+]
+
+[[package]]
+name = "robot-descriptions"
+version = "1.23.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gitpython" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/39/77/793187ba6c773e0ec0e7b0ccff1192e836994b62c275ea5c71df8c977813/robot_descriptions-1.23.0.tar.gz", hash = "sha256:c3f2f807fd2311534bdb0948172f001f1c0848d35dfdf9e4b6eee5e8e0040c85", size = 335361, upload-time = "2026-03-09T17:03:36.551Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/1b/78fff37a42652c190c3094e17d576df627712e9e31fb0c6b04f71d1c5ee5/robot_descriptions-1.23.0-py3-none-any.whl", hash = "sha256:053c1ce2eceb48ec883f22fe6d0a2851681015b3aafc31cc4dba9aef419aadbc", size = 127721, upload-time = "2026-03-09T17:03:34.021Z" },
 ]
 
 [[package]]
