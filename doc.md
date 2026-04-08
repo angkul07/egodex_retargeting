@@ -708,6 +708,165 @@ Ready to be concatenated with Stage 3 finger angles into the final
 
 ---
 
+## 8.7 Stage 3 dexterous finger retargeting — Inspire hand
+
+`src/mimicdreamer_egodex/finger_retargeting.py`. Converts each episode's
+active-hand fingertip trajectory (5 tips, world frame) into a per-frame
+Inspire-hand joint-angle trajectory via `dex-retargeting`'s
+`PositionOptimizer`. Uses the **bundled** `offline/inspire_hand_{left,
+right}.yml` configs from the `dex_retargeting` wheel and the URDFs
+vendored at `third_party/dex-urdf@7304c7f`.
+
+### 8.7.1 Target hand — Inspire (`plan.md` R-007)
+
+- 6 target (optimized) DOFs per hand:
+  `{index, middle, ring, pinky}_proximal_joint`, `thumb_proximal_yaw_joint`,
+  `thumb_proximal_pitch_joint`. These are the "canonical" action-vector
+  order we use downstream.
+- 6 additional URDF DOFs (intermediate + distal) are declared as **mimic
+  joints** in the URDF and track the proximals automatically. Total
+  non-dummy robot DOF = 12.
+- `add_dummy_free_joint: True` prepends a 6-DOF free joint at the hand
+  root so the optimizer can absorb any input-frame offset. Full robot
+  qpos shape = **18** (6 dummy + 12 hand).
+- URDF assets live at
+  `third_party/dex-urdf/robots/hands/inspire_hand/inspire_hand_{left,
+  right}.urdf`. Override the directory with `DEX_URDF_DIR` env var if
+  cloned elsewhere.
+
+### 8.7.2 Input contract (`plan.md` D-007)
+
+`SeqRetargeting.retarget(ref_value)` expects a **pre-sliced `(5, 3)`**
+array, in this exact order:
+
+    [thumb_tip, index_tip, middle_tip, ring_tip, pinky_tip]
+
+This matches the YAML's `target_link_names`. The caller is responsible
+for the slice — the `target_link_human_indices: [4, 8, 12, 16, 20]` field
+in the YAML is a MediaPipe-21-point landmark convention that
+`PositionOptimizer` does **not** apply internally. Passing a `(21, 3)`
+array triggers a silent `SmoothL1Loss` broadcast warning and produces
+garbage (near-zero deltas). Verified empirically on 2026-04-08.
+
+We feed the 5 tips in the wrist-relative world frame:
+`tip_world - wrist_world`. No re-orientation to a hand-local frame is
+needed because the dummy free joint absorbs it. No scaling either — the
+Inspire hand and a human adult hand are geometrically similar enough
+that 1:1 works (verified: episode-0 fingertip-to-wrist distance range
+0.123–0.151 m matches §7 exactly).
+
+### 8.7.3 EgoDex → Inspire fingertip mapping
+
+EgoDex calls pinky "LittleFinger"; otherwise names are straightforward:
+
+| Inspire target link | EgoDex joint (right)         | EgoDex joint (left)         |
+|---------------------|------------------------------|-----------------------------|
+| `thumb_tip`         | `rightThumbTip`              | `leftThumbTip`              |
+| `index_tip`         | `rightIndexFingerTip`        | `leftIndexFingerTip`        |
+| `middle_tip`        | `rightMiddleFingerTip`       | `leftMiddleFingerTip`       |
+| `ring_tip`          | `rightRingFingerTip`         | `leftRingFingerTip`         |
+| `pinky_tip`         | `rightLittleFingerTip`       | `leftLittleFingerTip`       |
+
+### 8.7.4 Retargeter cache + reset
+
+Building a `RetargetingConfig` includes constructing a pinocchio model +
+an nlopt optimizer, which isn't free (~100 ms). We cache one
+`SeqRetargeting` per side module-level and `reset()` it between
+episodes so the previous episode's terminal qpos doesn't warm-start the
+next episode's first frame. Within an episode, `last_qpos` is retained
+across frames so frame N warm-starts from frame N-1 — that is what drops
+the mean per-frame cost from 4.1 ms (cold start at frame 0 of ep 0) to
+2.4 ms at steady state in the 277-episode batch.
+
+### 8.7.5 Full-task batch results (277 episodes)
+
+`notebooks/04_stage3_batch.py`. Wall time **90.7 s** (~0.33 s/episode
+including h5 I/O; **2.4 ms/frame** mean on the pure retargeting loop).
+Zero failures. Active-hand split 221 R / 56 L (matches Stages 0–2).
+
+Per-episode per-joint range distribution across the 277 episodes:
+
+| target joint | p05 | p50 | mean | p95 | max |
+|---|---:|---:|---:|---:|---:|
+| index_proximal        | 0.189 | **0.393** | 0.400 | 0.658 | 1.013 |
+| middle_proximal       | 0.216 | **0.454** | 0.461 | 0.745 | 0.874 |
+| ring_proximal         | 0.212 | **0.420** | 0.425 | 0.682 | 0.857 |
+| pinky_proximal        | 0.192 | **0.426** | 0.436 | 0.700 | 0.895 |
+| thumb_proximal_yaw    | 0.185 | **0.433** | 0.450 | 0.772 | 1.310 |
+| thumb_proximal_pitch  | 0.144 | **0.279** | 0.288 | 0.467 | 0.576 |
+
+Headline fractions:
+
+- **96.8%** of episodes clear all 6/6 target joints > 0.1 rad
+- 71.1% have a minimum target joint range > 0.2 rad
+- 24.9% have a minimum target joint range > 0.3 rad
+- Mean fingertip-to-wrist distance (per episode): p05=0.127 m, p50=0.142 m,
+  p95=0.158 m — hand size is consistent within the dataset
+
+The thumb yaw distribution is the widest across episodes (p05 → p95
+goes from 0.19 rad to 0.77 rad) — this is **task-adaptive thumb
+opposition**. The stapler grasp in ep 0 produces 0.68 rad yaw; the
+iPhone grasp in ep 1 needs only 0.48 rad (flatter grip). The
+`mean_proximal`, by contrast, is tighter (p05 0.2 → p95 ~0.7) because
+all 4 fingers tend to close together in PnP.
+
+### 8.7.6 Variance-guard tail (9 episodes, decomposes cleanly)
+
+| idx | frames | hand  | var | min_range | tip_spread | note |
+|----:|------:|-------|---:|---:|---:|---|
+| 255 |  67 | right | 4/6 | 0.022 | 0.152 | short |
+| 251 | 113 | left  | 5/6 | 0.034 | 0.130 | **R-006 overlap** |
+| 180 |  38 | right | 5/6 | 0.054 | 0.153 | short |
+| 159 |  49 | left  | 5/6 | 0.071 | 0.145 | short |
+|  28 |  77 | right | 4/6 | 0.073 | 0.153 | short |
+| 131 | 142 | left  | 5/6 | 0.075 | 0.119 | **R-006 overlap** |
+| 271 |  77 | right | 5/6 | 0.079 | 0.130 | short |
+| 197 |  46 | right | 5/6 | 0.084 | 0.123 | short |
+| 102 | 100 | left  | 5/6 | 0.090 | 0.150 | **R-006 overlap** |
+
+Two disjoint causes:
+
+1. **R-006 data-quality overlap** (3 episodes: 102, 131, 251). These are
+   the same episodes where Stage 1 fell through to the RANSAC fallback
+   stub because the active-hand wrist confidence was below the floor.
+   Low wrist confidence → low fingertip confidence → noisy retargeting
+   input → narrower effective DOF ranges. This is a shared upstream
+   issue, not a Stage 3 bug.
+2. **Short-episode variance floor** (6 episodes, all under 80 frames).
+   Tip spreads are normal (0.12–0.15 m), so the fingers are physically
+   reasonable — they simply don't have enough frames for the grasp to
+   evolve through its full range. This is a data-duration floor, not a
+   retargeting failure.
+
+**Intersection with the Stage 2 IK tail is empty.** Stage 2's convergence
+tail (8 episodes with pos_err p95 > 50 mm) and Stage 3's variance-floor
+tail (9 episodes with <6/6) are completely disjoint failure modes.
+Neither is blocking; both are documented for Stage 4 ablation revisit.
+
+### 8.7.7 Artifact format
+
+`outputs/stage3/<idx>_fingers.npz`:
+
+| key | shape | dtype | notes |
+|-----|-------|-------|-------|
+| `q_finger` | `(T, 6)` | float32 | Inspire 6 target proximals, action-vector input for Stage 4. Order: `[index, middle, ring, pinky, thumb_yaw, thumb_pitch]`. |
+| `q_full` | `(T, 18)` | float32 | Full robot qpos (6 dummy free-joint + 12 hand DOFs) — for MuJoCo visualization. |
+| `joint_names_target` | `(6,)` | str | names for `q_finger` columns |
+| `joint_names_full` | `(18,)` | str | names for `q_full` columns (pinocchio order) |
+| `tips_rel` | `(T, 5, 3)` | float32 | wrist-relative fingertip positions (the retargeter's input) |
+| `wrist_world` | `(T, 3)` | float32 | absolute wrist position (debugging) |
+| `tips_world` | `(T, 5, 3)` | float32 | absolute fingertip positions (debugging) |
+| `tips_conf` | `(T, 5)` | float32 | per-fingertip ARKit confidence |
+| `active_hand` | scalar | str | `"left"` or `"right"` |
+| `hand_model` | scalar | str | `"inspire"` |
+
+The Stage 4 action vector per episode is assembled as:
+
+    a_t = concatenate([stage2[q][t], stage2[gripper][t], stage3[q_finger][t]])
+        # shape (13,) = 6 UR5e + 1 gripper + 6 Inspire proximals
+
+---
+
 ## 9. File / artifact index
 
 Code (read these to verify any claim above):
@@ -720,6 +879,8 @@ Code (read these to verify any claim above):
 | `notebooks/03_stage2_batch.py` | Full-task batch driver. Aggregates existing Stage 1 metrics JSONs into a CSV + aggregate JSON, then runs Stage 2 `process_episode` over every episode in a single process (UR5e MJCF cached), writing the Stage 2 CSV + aggregate JSON. Single source of the batch distributions in §8.5.5 / §8.6.7 / §8.6.8. |
 | `src/mimicdreamer_egodex/egostabilizer.py` | Stage 1 deliverable. Plane-induced homography stabilizer with R-001/R-002/R-003/R-004 baked in. CLI: `uv run python -m mimicdreamer_egodex.egostabilizer <hdf5> --out-dir outputs/stage1`. Writes stabilized MP4 + metrics JSON. |
 | `src/mimicdreamer_egodex/action_alignment.py` | Stage 2 deliverable. UR5e IK (mink FrameTask + smoothness PostureTask) on H2R-aligned wrist poses, plus fingertip-spread gripper signal. CLI: `uv run python -m mimicdreamer_egodex.action_alignment <hdf5> --out-dir outputs/stage2`. Writes `<idx>_actions.npz` + metrics JSON. |
+| `src/mimicdreamer_egodex/finger_retargeting.py` | Stage 3 deliverable. Inspire 6-DOF finger retargeting via `dex-retargeting`'s `PositionOptimizer` on wrist-relative EgoDex fingertip positions. Caches one `SeqRetargeting` per side. CLI: `uv run python -m mimicdreamer_egodex.finger_retargeting <hdf5> --out-dir outputs/stage3`. Writes `<idx>_fingers.npz` + metrics JSON. |
+| `notebooks/04_stage3_batch.py` | Stage 3 full-task batch driver. Runs `process_episode` over every `basic_pick_place` episode (retargeter cached) and writes `outputs/stage3_summary_basic_pick_place.csv` + `outputs/stage3_aggregate.json`. Source of §8.7.5 / §8.7.6 distributions. |
 
 Artifacts:
 
@@ -738,6 +899,11 @@ Artifacts:
 | `outputs/stage1_aggregate.json` | Stage 1 headline distributions (method mix, active-hand split, per-metric percentiles, pass fractions) — source for §8.5.5 |
 | `outputs/stage2_summary_basic_pick_place.csv` | Per-episode Stage 2 IK + variance metrics (1 row per episode) |
 | `outputs/stage2_aggregate.json` | Stage 2 headline distributions — source for §8.6.7 / §8.6.8 |
+| `outputs/stage3/<idx>_fingers.npz` | Stage 3 Inspire joint trajectory + wrist-relative tip inputs per episode |
+| `outputs/stage3/<idx>_metrics.json` | Stage 3 per-episode retargeting metrics + variance report |
+| `outputs/stage3_summary_basic_pick_place.csv` | Per-episode Stage 3 metrics (1 row per episode) |
+| `outputs/stage3_aggregate.json` | Stage 3 headline distributions — source for §8.7.5 / §8.7.6 |
+| `third_party/dex-urdf/` | Vendored dex-urdf repo @ `7304c7f` (gitignored). Provides Inspire/Allegro/Shadow/LEAP URDFs for Stage 3. Re-clone per README if missing. |
 | `logs/session_2026-04-07.md` | narrative session log |
 | `logs/runs/2026-04-07_*.log` | captured stdout/stderr from every script run |
 
@@ -751,6 +917,9 @@ Decisions:
 - `plan.md` R-004 — plane-homography sign correction
 - `plan.md` R-005 — UR5e chosen as Stage 2 arm URDF
 - `plan.md` R-006 — 6 Stage 1 episodes fall through to the RANSAC fallback stub
+- `plan.md` R-007 — Inspire hand chosen as Stage 3 dexterous target
+- `plan.md` D-007 — `SeqRetargeting.retarget` needs a pre-sliced `(5, 3)` input
+- `plan.md` D-008 — `uv sync --group <stage>` replaces the active group set
 
 If any of the above goes stale, update both this file *and* the matching
 entry in `plan.md` so they don't drift.

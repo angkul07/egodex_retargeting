@@ -27,9 +27,16 @@ additional splits. See `plan.md` D-005.
 ## Tooling — always use uv
 - `uv` is preinstalled. **Never** call `pip` or `python -m pip` directly.
 - Add a dep:        `uv add <pkg>`           (base) or `uv add --group stage2 <pkg>`
-- Sync env:         `uv sync`                (base) or `uv sync --group stage1 --group stage2`
+- Sync env:         `uv sync`                (base) or `uv sync --group stage1 --group stage2 --group stage3`
 - Run a script:     `uv run python foo.py`
 - One-off install:  `uv pip install <pkg>`   (use this for torch nightly — see below)
+- **`uv sync --group` gotcha** (see `plan.md` D-008): the `--group` flag
+  **replaces** the active group selection, it does NOT append. Always pass
+  every active group simultaneously or you'll silently lose deps from the
+  unlisted groups. Current active set: `stage1 stage2 stage3`.
+- **Don't `cd` without coming back.** The Bash tool persists its cwd across
+  calls. A stray `cd /somewhere` will cause subsequent `uv run` from that
+  directory to create a new throwaway `.venv`. Prefer absolute paths.
 
 ### Torch / lerobot exception
 torch + torchvision are NOT in `pyproject.toml`. The cu128 nightly wheels depend on
@@ -114,5 +121,13 @@ file paths and dataset IDs touched, hyperparameters.
 - **Arm target = UR5e** (`robot_descriptions.ur5e_mj_description`),
   end-effector frame = `attachment_site`. Decoupled from the Stage 3
   dexterous hand. See `plan.md` R-005.
+- **Dexterous hand target = Inspire** (6 target proximals via
+  `dex-retargeting`'s bundled `configs/offline/inspire_hand_{side}.yml`).
+  URDFs are NOT in the pip wheel — vendored at
+  `third_party/dex-urdf@7304c7f` (gitignored). Override location via
+  `$DEX_URDF_DIR`. `SeqRetargeting.retarget(ref_value)` wants a
+  **pre-sliced `(5, 3)`** array in `[thumb, index, middle, ring, pinky]`
+  order, NOT the `(21, 3)` MediaPipe-landmark array. See `plan.md`
+  R-007 / D-007.
 - Always write a "variance check" output when producing trajectories — the FIVER v1
   failure mode (collapsed joint ranges) is the thing we're explicitly trying to avoid.

@@ -20,6 +20,12 @@ outputs/
 # The narrative session logs (logs/session_*.md) ARE committed.
 logs/runs/
 
+# --- Vendored third-party assets ---
+# Cloned upstream repos that the code depends on but we don't edit. Currently:
+# - third_party/dex-urdf @ 7304c7f — Inspire/Allegro/etc. hand URDFs used by
+#   dex-retargeting (Stage 3). README documents the clone recipe.
+third_party/
+
 # --- Editor / IDE / OS ---
 .claude/
 .idea/

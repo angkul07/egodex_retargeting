@@ -9,25 +9,32 @@ The original 4-stage roadmap (Stages 0–4 + contributions + timeline) lives in
 
 ## Current state — 2026-04-08 (Day 1)
 
-**Stage**: 1 and 2 first-cut complete on the full 277-episode
+**Stage**: 1, 2, and 3 first-cut complete on the full 277-episode
 `basic_pick_place` test split.
-**Last action**: Wrote `notebooks/03_stage2_batch.py` (full-task batch
-driver + Stage 1 metrics aggregator in one pass), ran it: 277/277 episodes,
-0 failures, **62.7 s total wall time** (~0.23 s per episode). Outputs at
-`outputs/stage{1,2}_summary_basic_pick_place.csv` and
-`outputs/stage{1,2}_aggregate.json`. Two findings worth flagging:
-**(a)** 6 Stage 1 episodes fell into the `ransac_fallback` stub path
-(contradicting R-004's "no episode expected to fail" — see R-006); **(b)**
-8 Stage 2 episodes have IK `pos_err_p95 > 50 mm`, with a clean worst case
-of ep 190 (median 100 mm, all 171 frames tracked — real IK edge, not a data
-bug). The two tails do **not** overlap, so the Stage 2 tail is not caused
-by bad wrist tracking. Run log:
-`logs/runs/2026-04-08_092549_stage2_batch.log`.
-**Next action**: (a) start Stage 3 (`finger_retargeting.py`) — the blocker
-was Stage 2, not the tail; (b) investigate the Stage 2 IK tail in a side
-session if it matters for the Stage 4 ablation; (c) implement the real
-vidstab fallback for the 6 R-006 episodes if Stage 4 metrics regress on
-them.
+**Last action**: Wrote `src/mimicdreamer_egodex/finger_retargeting.py`
+(Stage 3 deliverable) + `notebooks/04_stage3_batch.py` and ran the batch:
+277/277 episodes, 0 failures, **90.7 s total wall time** (~2.4 ms/frame
+mean — fast because the `SeqRetargeting` instance is per-side cached and
+warm-starts after frame 0 of each episode). Target hand = **Inspire**;
+`dex-retargeting` ships `offline/inspire_hand_{left,right}.yml` so no
+custom YAML is needed, and the URDFs are vendored at
+`third_party/dex-urdf@7304c7f`. Results: **96.8%** of episodes have 6/6
+target proximals clearing the Inspire variance guard (> 0.1 rad range),
+thumb yaw has the widest per-episode variance (p05 0.19 → p95 0.77 rad,
+task-adaptive opposition), median `ms/frame = 2.4`. Stage 3 tail (9
+episodes with <6/6) splits cleanly into 3 episodes overlapping Stage 1
+R-006 (low wrist/fingertip confidence → shared data issue) + 6 short
+episodes (<80 frames, data-constrained variance floor); no overlap with
+Stage 2's IK tail. Torch nightly cu128 is now installed out-of-band (RTX
+5090 sm_120 verified) so Stage 4's environment is ~half-prepared.
+Run log: `logs/runs/2026-04-08_104408_stage3_batch.log`.
+**Next action**: (a) Stage 4 — install lerobot out-of-band per D-001,
+convert stabilized frames + `[q_arm_6, gripper_1, q_finger_6]` action
+vectors into the lerobot dataset format, train ACT on `basic_pick_place`,
+build the ablation table from §4.4. (b) Optional MuJoCo visualization of
+Stage 3 outputs via a `notebooks/05_stage3_visualize.py` if/when the user
+wants to eyeball a rollout. (c) Neither the Stage 1 R-006 fallback nor
+the Stage 2 IK tail has been re-investigated — still parked.
 
 ### Environment status
 - [x] uv project initialized, Python 3.13. (Reinstalled uv on 2026-04-08:
@@ -39,8 +46,16 @@ them.
 - [x] Stage 2 deps installed (`uv sync --group stage2` + `uv add --group stage2
       robot_descriptions`): mink 1.1.0, mujoco 3.6.0, quadprog 0.1.13,
       qpsolvers 4.11.0, daqp 0.8.5, robot_descriptions 1.23.0.
-- [ ] Stage 3 deps: dex-retargeting.
-- [ ] Stage 4: torch nightly (cu128) + lerobot — installed manually, see below.
+- [x] Stage 3 deps installed (`uv sync --group stage1 --group stage2 --group
+      stage3`): dex-retargeting 0.4.5, pin 3.9.0, libpinocchio 3.9.0,
+      eigenpy 3.12.0, nlopt 2.10.0, pytransform3d 3.14.4, lxml 6.0.2,
+      libcoal 3.0.2. URDFs vendored at `third_party/dex-urdf@7304c7f`.
+- [x] Torch nightly cu128 installed out-of-band (D-001 recipe): torch
+      2.12.0.dev20260407+cu128, torchvision 0.27.0.dev20260407+cu128,
+      triton 3.7.0+git9c288bc5. RTX 5090 sm_120 capability (12, 0)
+      verified. Unblocks `dex_retargeting` (which hard-imports torch) and
+      prepares Stage 4.
+- [ ] Stage 4: lerobot — installed manually when Stage 4 starts.
 - [x] EgoDex **test split only** downloaded (`data/test.zip`, 16.1 GB) and
       extracted to `data/test/` — 111 task subdirs, 6,598 file entries.
       See **D-005** below: we are not downloading any other EgoDex split.
@@ -254,6 +269,94 @@ no plane-induced homography can predict. The metric is only meaningful after
 inlier filtering — keep the best 50% of per-pair reprojection errors. The
 implementation in `homography_reprojection_rmse` does this.
 
+### D-007: Stage 3 — `SeqRetargeting.retarget(ref_value)` expects a pre-sliced `(5, 3)` input  *(decided 2026-04-08)*
+**Why**: The YAML `target_link_human_indices: [4, 8, 12, 16, 20]` in
+`dex-retargeting/configs/offline/inspire_hand_*.yml` is a MediaPipe-21-point
+landmark layout — those are the fingertip indices in the 21-point hand
+model. The code however does **not** index into the 21-point array
+internally: `SeqRetargeting.retarget` passes `ref_value` straight through
+to `PositionOptimizer.get_objective_function`, which feeds it directly
+into `torch.nn.SmoothL1Loss` against a `(5, 3)` body-position tensor.
+Passing a `(21, 3)` array triggers a silent PyTorch broadcasting warning
+and produces garbage. Caller must pre-slice to `(5, 3)` in the order
+matching the config's `target_link_names`:
+
+    [thumb_tip, index_tip, middle_tip, ring_tip, pinky_tip]
+
+**How to apply**: `finger_retargeting.py::wrist_relative_tips` returns a
+`(T, 5, 3)` array in exactly this order; Stage 3's extraction puts
+`<side>ThumbTip`, `<side>IndexFingerTip`, `<side>MiddleFingerTip`,
+`<side>RingFingerTip`, `<side>LittleFingerTip` (= pinky) in that order.
+Do not pass a length-21 array. Flagged inline in the module docstring
+and verified empirically on `basic_pick_place/0` — the `(5, 3)` path
+produces per-joint ranges of 0.41–0.68 rad; the `(21, 3)` path silently
+converges to near-zero deltas. (The latter is how the earlier dry-run
+with fake inputs ended up with 0.0001 rad "curl deltas".)
+
+### D-008: `uv sync --group <stage>` replaces the active group set  *(decided 2026-04-08)*
+**Why**: The first `uv sync --group stage3` I ran silently **uninstalled**
+the Stage 2 packages (mink, mujoco, quadprog, robot_descriptions, etc.)
+because uv treats the `--group` flag as a replacement selection, not
+additive. This broke `action_alignment.py`'s import chain and would have
+broken any re-run of the Stage 2 batch.
+
+**How to apply**: when syncing, always pass **every active group
+simultaneously**:
+
+```bash
+uv sync --group stage1 --group stage2 --group stage3
+```
+
+This rule is also mirrored into `CLAUDE.md` under the tooling section
+so future sessions don't trip over it. `uv add --group <stage> <pkg>`
+does not have the same footgun — it only edits the one group. The trap
+is `uv sync` specifically.
+
+### R-007: Stage 3 — Inspire hand locked in; `dex-retargeting` ships the config  *(answered 2026-04-08)*
+**Original question**: Does `dex-retargeting` ship an Inspire-hand config
+in `assets/`? If not, write a YAML for the Allegro hand instead.
+
+**Answer**: **Yes, Inspire is supported out of the box.** The
+`dex_retargeting` wheel bundles both
+`configs/offline/inspire_hand_left.yml` and
+`configs/offline/inspire_hand_right.yml` (also teleop variants which we
+don't use). The referenced URDFs (`inspire_hand/inspire_hand_{side}.urdf`)
+live in the separate `dex-urdf` repo (the `dex-retargeting` pip wheel
+does NOT carry URDFs). We vendor it at
+`third_party/dex-urdf@7304c7fb59214dab870eca02cf26f76e944e12df`
+(gitignored) and point `RetargetingConfig.set_default_urdf_dir` at
+`third_party/dex-urdf/robots/hands` in `finger_retargeting.py::_ensure_urdf_dir`.
+Override via `$DEX_URDF_DIR` if the repo is cloned elsewhere.
+
+Inspire details:
+- Type: `position` retargeting (5-fingertip positions, SmoothL1 loss).
+- 12 non-dummy URDF DOFs, of which **6 are "target" (optimized)**:
+  `{index, middle, ring, pinky}_proximal_joint`, `thumb_proximal_yaw_joint`,
+  `thumb_proximal_pitch_joint`. The intermediate and distal joints are
+  declared as mimic joints in the URDF and track their proximals
+  automatically.
+- `add_dummy_free_joint: True` prepends a 6-DOF free joint at the hand
+  root so the optimizer can absorb any input-frame offset — which is why
+  we can feed wrist-relative positions in world axes without rotating to
+  a hand-local frame.
+- Input contract is the `(5, 3)` slice described in D-007.
+
+**How to apply (Stage 3/4)**:
+- Stage 3: `finger_retargeting.py` writes `q_finger (T, 6)` per episode,
+  in the action-vector order
+  `[index, middle, ring, pinky, thumb_yaw, thumb_pitch]`.
+- Stage 4: final action vector per `initial_plan.md` §3.3 is
+  `[q_arm_6, gripper_1, q_finger_6]` = **13 dimensions**. Concatenate
+  Stage 2's `outputs/stage2/<idx>_actions.npz` with Stage 3's
+  `outputs/stage3/<idx>_fingers.npz` at dataset-build time.
+
+The hand choice can still be revisited later (Allegro has 16 DOFs, LEAP
+has 16, Shadow has ~22) — all four configs are in the same
+`dex-retargeting/configs/offline/` directory and would require only
+swapping one constant in `finger_retargeting.py`. Sticking with Inspire
+for the replication because 6 DOFs keeps the Stage 4 action head small
+and matches the paper's closest comparable setup.
+
 ### R-006: Stage 1 — 6 episodes actually fall through to the RANSAC fallback  *(answered 2026-04-08)*
 **Original claim (R-004 / doc.md §8.5.4)**: the `CONF_TRACKED = 0.10`
 confidence floor is loose enough that "no episode in the test split is
@@ -381,11 +484,12 @@ directly as an IK task weight rather than thresholding twice.
 ---
 
 ## Open questions (resolve before the relevant stage)
-- **Stage 3**: Does `dex-retargeting` ship an Inspire-hand config in `assets/`? If
-  not, write a YAML for the Allegro hand instead — the dexterity story is the same.
 - **Stage 4**: MuJoCo eval env for `basic_pick_place` — build from scratch, or reuse
   an existing one (mujoco_menagerie? lerobot envs)? Defer until Stage 4 actually
   starts; estimate time then.
+- **Stage 4**: lerobot install path — try `uv pip install --no-deps lerobot`
+  + hand-install remaining deps, or fork to bump `torch<2.11`? Decide when
+  Stage 4 starts; D-001 documents the choice.
 
 ---
 
@@ -396,7 +500,7 @@ directly as an IK task weight rather than thresholding twice.
 | 0     | done — 2026-04-07 | Test split downloaded + extracted; exploration + variance report; R-001/R-002 calibrated. (`part2` download is obsolete per D-005; concept reading is on the user, not Claude.) |
 | 1     | done — 2026-04-08 | Full batch over all 277 `basic_pick_place` episodes: 271 `exact`, **6 `ransac_fallback` (stub)**, 0 failures. Reduction ratio median 2.50×, p95 8.28×, 61.7% of episodes > 2×, 24.5% > 4×. Inlier H-RMSE median 2.66 px, 92.4% < 10 px. Raw cam angle median 0.17°/frame (low-motion AVP wearer). See `doc.md` §8.5.5 for distributions. The 6 fallback episodes are documented under R-006; the vidstab path is still a stub and will be wired in only if Stage 4 metrics regress on them. |
 | 2     | done — 2026-04-08 (first cut) | Full batch over all 277 episodes: **0 failures**, 62.7 s wall total (~0.23 s/ep). pos_err median distribution: mean 2.48 mm, p95 4.53 mm, **max 99.6 mm** (one bad ep). 96.8% of episodes have pos_err median < 5 mm. ori_err median 0.29° (median of medians). FIVER-collapse guard: **90.6%** of episodes clear ≥5/6 joints > 0.3 rad, 49.5% clear 6/6. No systemic FIVER collapse, but the 0.3-rad-on-all-6-joints threshold is tighter than necessary — per the Stage 4 §4.4 ablation we care about the reaching joints clearing it, which ~100% do. Stage 2 IK tail (8 episodes with p95 > 50 mm) does not overlap with the Stage 1 R-006 episodes — it's an IK-convergence issue, not a data issue. Investigation deferred; see `doc.md` §8.6.8. |
-| 3     | not started | Dexterous finger retargeting via dex-retargeting. |
+| 3     | done — 2026-04-08 (first cut) | `src/mimicdreamer_egodex/finger_retargeting.py` written; **Inspire** hand locked in via R-007 (dex-retargeting ships the config out of the box, URDFs vendored at `third_party/dex-urdf@7304c7f`). Full batch over all 277 episodes: **0 failures, 90.7 s total (~2.4 ms/frame mean)**, 96.8% of episodes clear 6/6 target proximals > 0.1 rad. Task-adaptive thumb opposition visible in the data (stapler grasp 0.68 rad yaw vs. iPhone 0.48 rad). Stage 3 tail (9 episodes with <6/6) decomposes into 3 Stage-1-R-006 overlaps (shared data-quality issue) + 6 short (<80-frame) episodes hitting a data-constrained variance floor. Zero overlap with the Stage 2 IK tail. See `doc.md` §8.7 for distributions. |
 | 4     | not started | Train policy on `basic_pick_place`, ablation table. |
 
 Mark each stage `in progress` when you start it and `done — YYYY-MM-DD` when the
