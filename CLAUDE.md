@@ -129,5 +129,23 @@ file paths and dataset IDs touched, hyperparameters.
   **pre-sliced `(5, 3)`** array in `[thumb, index, middle, ring, pinky]`
   order, NOT the `(21, 3)` MediaPipe-landmark array. See `plan.md`
   R-007 / D-007.
+- **Stage 3 retargeting is affordance-class adequate, not precision.**
+  Per-finger error median is 5–10 mm (~60% of the Inspire fingerpad
+  width). Different objects within the same affordance class
+  (iphone ↔ mouse, donut ↔ slime container) collapse to nearly identical
+  6-DOF grasps; that's an embodiment limit, not a bug. The action
+  signal encodes *how to grasp*; object identity comes from the RGB
+  observation. Trust it for power grasps and BC training; do NOT trust
+  it for precision tasks or fine within-class discrimination. The
+  question "is the dex hand actually pulling its weight" is decided by
+  the Stage 4 §4.4 ablation, not by retargeting metrics in isolation.
+  See `plan.md` R-008 and `doc.md` §8.7.8.
+- **MuJoCo headless on RunPod**: needs `apt install libegl1 libglvnd0`
+  one-time, then `os.environ["MUJOCO_GL"] = "egl"` before
+  `import mujoco`. URDF loading needs the `<mujoco><compiler
+  strippath="false" discardvisual="true" meshdir="..."/></mujoco>`
+  injection. Offscreen framebuffer is fixed at 640×480 for URDF-based
+  models (the `<visual><global/>` extension is silently ignored). See
+  `plan.md` D-009 / D-010 / D-011.
 - Always write a "variance check" output when producing trajectories — the FIVER v1
   failure mode (collapsed joint ranges) is the thing we're explicitly trying to avoid.

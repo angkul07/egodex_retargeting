@@ -10,7 +10,10 @@ The original 4-stage roadmap (Stages 0–4 + contributions + timeline) lives in
 ## Current state — 2026-04-08 (Day 1)
 
 **Stage**: 1, 2, and 3 first-cut complete on the full 277-episode
-`basic_pick_place` test split.
+`basic_pick_place` test split. Stage 3 has a quality assessment
+(R-008): retargeting captures grasp affordance class but not
+within-class precision — sufficient for Stage 4 BC, not a finished
+teleop product.
 **Last action**: Wrote `src/mimicdreamer_egodex/finger_retargeting.py`
 (Stage 3 deliverable) + `notebooks/04_stage3_batch.py` and ran the batch:
 277/277 episodes, 0 failures, **90.7 s total wall time** (~2.4 ms/frame
@@ -357,6 +360,135 @@ swapping one constant in `finger_retargeting.py`. Sticking with Inspire
 for the replication because 6 DOFs keeps the Stage 4 action head small
 and matches the paper's closest comparable setup.
 
+### R-008: Stage 3 — retargeting quality is affordance-class adequate, not within-class precision  *(answered 2026-04-08)*
+**Original question**: Is the Stage 3 finger retargeting actually
+"good"? The 96.8% variance-guard pass rate (R-007) tells us nothing
+*moves wrong*, but says nothing about whether the retargeted joint
+angles encode object identity in a useful way.
+
+**Answer**: The retargeting is **successful for the project's goal**
+(BC training in Stage 4) but is **not** a precision-grade dexterous
+teleoperation system. Concretely:
+
+- **Per-finger position error** between human EgoDex fingertips and
+  Inspire FK fingertips (`notebooks/05_stage3_visualize.py` on a
+  4-episode sample): **median 5–10 mm, p95 10–20 mm**. Inspire's
+  fingerpad is ~15 mm wide, so a 10 mm error is ~60% of the pad. Fine
+  for power grasps (the dataset is 100% power grasps), marginal for
+  precision pinches.
+
+- **Per-object grasp clustering** (`notebooks/07_grasp_clustering.py`)
+  on 174 episodes covering 25 distinct objects (each with ≥ 3 episodes):
+  - 6-D peak-grasp signature: separation ratio 0.81, silhouette −0.27
+  - **18-D trajectory signature: separation ratio 0.95, silhouette −0.15**
+  - Both raw numbers are < 1 / negative — but the *most-distinct pairs*
+    are physically meaningful: `dice box vs toy block = 1.34 rad`,
+    `iphone vs toy block = 1.31 rad`, `iphone vs fry = 1.26 rad`. The
+    *most-similar pairs* are also physically similar:
+    `iphone vs mouse = 0.15`, `container of slime vs donut = 0.16`,
+    `plushie vs tea cup = 0.17`. Pairwise distances among the 6 largest
+    object groups show clean affordance-class structure: small-hard
+    objects (`block`, `dice`, `egg`) cluster together; soft plush
+    objects (`duck`, `plushie`) cluster together; cross-group distances
+    are larger.
+
+- **Verdict**: the retargeting captures **grasp affordance class**
+  (small hard, soft plush, flat thin, …) but **does not** discriminate
+  fine-grained within-class differences. This is consistent with three
+  hard limits: (a) the 6-DOF Inspire embodiment can only express a
+  limited grasp vocabulary, (b) the `llm_objects` labels are noisy
+  ("block" lumps 41 physically diverse cubes together), (c) we are
+  matching fingertip *positions*, not contact normals or forces.
+
+**What this means for Stage 4**: this is **enough**. The action signal
+needs to encode *how to grasp* (affordance level); object identity
+comes from the RGB observation. The BC policy will absorb residual
+retargeting noise. The bar this needs to clear is set by the §4.4
+ablation table — outperform the binary-gripper baseline. That
+experiment hasn't run yet; the verdict on "is the dexterous hand
+actually pulling its weight" is **TBD until Stage 4**.
+
+**What this is NOT**: not physics-validated (no contact-closure check
+on retargeted poses), not closed-loop (no force feedback, same as the
+MimicDreamer baseline), not jointly optimized with Stage 2 (the wrist
+mount can drift between the two stages), not validated on anything
+other than `basic_pick_place`.
+
+**How to apply**:
+- Trust the action signal at the **affordance class** level.
+- Do **not** trust it for fine within-class object discrimination —
+  rely on the RGB input for that.
+- Re-evaluate after Stage 4 ablation results land.
+- Full discussion is in `doc.md` §8.7.8.
+
+### D-009: RunPod needs `apt install libegl1` for MuJoCo headless rendering  *(decided 2026-04-08)*
+**Why**: The RunPod base image ships
+`libEGL_nvidia.so.570.195.03` (the NVIDIA driver's EGL implementation)
+but **not** the generic `libEGL.so.1` dispatcher that PyOpenGL looks
+for. `import mujoco` followed by `Renderer(...)` fails with
+`AttributeError: 'NoneType' object has no attribute 'eglQueryString'`
+because PyOpenGL can't find the entry point.
+
+**How to apply**: one-liner per fresh container:
+
+```bash
+apt-get update && apt-get install -y libegl1 libglvnd0
+```
+
+Then `os.environ["MUJOCO_GL"] = "egl"` **before** `import mujoco` in
+any script that uses offscreen rendering. The
+`mujoco.Renderer(model, h, w)` smoke test should pass with non-zero
+nonzero pixel count.
+
+`libegl1-mesa` was renamed/removed in Ubuntu 24.04 — don't install
+that one, just `libegl1` + `libglvnd0`.
+
+### D-010: MuJoCo URDF loader needs `strippath="false" discardvisual="true"` injection  *(decided 2026-04-08)*
+**Why**: MuJoCo's URDF loader has two opinionated defaults:
+
+1. `strippath="true"` — flattens `filename="meshes/visual/foo.glb"`
+   to `foo.glb`, breaking subdirectory layouts like dex-urdf's
+   `meshes/{visual,collision}/`.
+2. It loads visual meshes by default, and dex-urdf's visual meshes
+   are `.glb` (not supported by MuJoCo — only `.obj` and `.stl`
+   work). The collision meshes are `.obj` and load fine.
+
+**How to apply**: inject a `<mujoco>` extension block immediately
+after `<robot ...>` when reading the URDF, before passing it to
+`mujoco.MjModel.from_xml_path`:
+
+```python
+mesh_dir = str(urdf_path.parent.absolute()) + "/"
+injection = (
+    f'<mujoco>'
+    f'<compiler meshdir="{mesh_dir}" strippath="false" '
+    f'discardvisual="true"/>'
+    f'</mujoco>'
+)
+txt = re.sub(r"(<robot[^>]*>)", r"\1" + injection, urdf_text, count=1)
+```
+
+The hand will render with collision-mesh primitives (blocky/industrial
+look — fully legible, just not pretty). See
+`notebooks/06_stage3_animate.py::_inspire_mjcf_prepare`.
+
+### D-011: MuJoCo URDF `<mujoco>` extension silently ignores `<visual>` children  *(decided 2026-04-08)*
+**Why**: I tried injecting a `<visual><global offwidth="720" offheight="480"/></visual>`
+sub-element into the same `<mujoco>` block to enlarge the offscreen
+framebuffer beyond the 640×480 default. MuJoCo's URDF parser silently
+**discarded** it — only `<compiler>` was honored. Asking for a
+720-wide render still raised
+`Image width 720 > framebuffer width 640`.
+
+**How to apply**: when rendering Inspire (or any URDF) via MuJoCo
+offscreen, **use the default 640×480 framebuffer** (matplotlib
+animations can stay at 720×480 — only the MuJoCo render is constrained).
+Define separate constants `MJ_FRAME_W = 640, MJ_FRAME_H = 480` and
+build `mujoco.Renderer(model, MJ_FRAME_H, MJ_FRAME_W)`. Larger
+framebuffers would require writing a standalone MJCF wrapper — but
+MJCF can't `<include>` URDFs, so that path is closed for vendored
+URDF assets.
+
 ### R-006: Stage 1 — 6 episodes actually fall through to the RANSAC fallback  *(answered 2026-04-08)*
 **Original claim (R-004 / doc.md §8.5.4)**: the `CONF_TRACKED = 0.10`
 confidence floor is loose enough that "no episode in the test split is
@@ -500,7 +632,7 @@ directly as an IK task weight rather than thresholding twice.
 | 0     | done — 2026-04-07 | Test split downloaded + extracted; exploration + variance report; R-001/R-002 calibrated. (`part2` download is obsolete per D-005; concept reading is on the user, not Claude.) |
 | 1     | done — 2026-04-08 | Full batch over all 277 `basic_pick_place` episodes: 271 `exact`, **6 `ransac_fallback` (stub)**, 0 failures. Reduction ratio median 2.50×, p95 8.28×, 61.7% of episodes > 2×, 24.5% > 4×. Inlier H-RMSE median 2.66 px, 92.4% < 10 px. Raw cam angle median 0.17°/frame (low-motion AVP wearer). See `doc.md` §8.5.5 for distributions. The 6 fallback episodes are documented under R-006; the vidstab path is still a stub and will be wired in only if Stage 4 metrics regress on them. |
 | 2     | done — 2026-04-08 (first cut) | Full batch over all 277 episodes: **0 failures**, 62.7 s wall total (~0.23 s/ep). pos_err median distribution: mean 2.48 mm, p95 4.53 mm, **max 99.6 mm** (one bad ep). 96.8% of episodes have pos_err median < 5 mm. ori_err median 0.29° (median of medians). FIVER-collapse guard: **90.6%** of episodes clear ≥5/6 joints > 0.3 rad, 49.5% clear 6/6. No systemic FIVER collapse, but the 0.3-rad-on-all-6-joints threshold is tighter than necessary — per the Stage 4 §4.4 ablation we care about the reaching joints clearing it, which ~100% do. Stage 2 IK tail (8 episodes with p95 > 50 mm) does not overlap with the Stage 1 R-006 episodes — it's an IK-convergence issue, not a data issue. Investigation deferred; see `doc.md` §8.6.8. |
-| 3     | done — 2026-04-08 (first cut) | `src/mimicdreamer_egodex/finger_retargeting.py` written; **Inspire** hand locked in via R-007 (dex-retargeting ships the config out of the box, URDFs vendored at `third_party/dex-urdf@7304c7f`). Full batch over all 277 episodes: **0 failures, 90.7 s total (~2.4 ms/frame mean)**, 96.8% of episodes clear 6/6 target proximals > 0.1 rad. Task-adaptive thumb opposition visible in the data (stapler grasp 0.68 rad yaw vs. iPhone 0.48 rad). Stage 3 tail (9 episodes with <6/6) decomposes into 3 Stage-1-R-006 overlaps (shared data-quality issue) + 6 short (<80-frame) episodes hitting a data-constrained variance floor. Zero overlap with the Stage 2 IK tail. See `doc.md` §8.7 for distributions. |
+| 3     | done — 2026-04-08 (first cut + quality assessment) | `src/mimicdreamer_egodex/finger_retargeting.py` written; **Inspire** hand locked in via R-007 (dex-retargeting ships the config out of the box, URDFs vendored at `third_party/dex-urdf@7304c7f`). Full batch over all 277 episodes: **0 failures, 90.7 s total (~2.4 ms/frame mean)**, 96.8% of episodes clear 6/6 target proximals > 0.1 rad. Task-adaptive thumb opposition visible (stapler 0.68 rad vs iPhone 0.48 rad yaw). **Quality assessment (R-008)**: per-finger position error median 5–10 mm (Inspire fingerpad ~15 mm — fine for power grasps, marginal for precision); per-object grasp clustering on 25 objects shows separation ratio 0.95, silhouette −0.15 — captures **affordance class** but not within-class precision. Verdict: **enough for Stage 4 BC training**, not a finished dexterous teleop system. Stage 3 tail (9 episodes with <6/6) decomposes into 3 Stage-1-R-006 overlaps + 6 short (<80-frame) episodes. Zero overlap with the Stage 2 IK tail. See `doc.md` §8.7 (esp. §8.7.8). |
 | 4     | not started | Train policy on `basic_pick_place`, ablation table. |
 
 Mark each stage `in progress` when you start it and `done — YYYY-MM-DD` when the

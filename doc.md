@@ -843,7 +843,173 @@ tail (8 episodes with pos_err p95 > 50 mm) and Stage 3's variance-floor
 tail (9 episodes with <6/6) are completely disjoint failure modes.
 Neither is blocking; both are documented for Stage 4 ablation revisit.
 
-### 8.7.7 Artifact format
+### 8.7.8 Retargeting quality assessment
+
+This section is the **honest evaluation** of how good the Stage 3
+retargeting actually is. It is the answer to "is this successful?" and
+exists so future sessions don't oversell the results.
+
+#### Pipeline-level quality (already covered in §8.7.5)
+
+Strong on the technical axes:
+
+- 277/277 episodes complete, 0 failures
+- 2.4 ms/frame mean, 90.7 s for the full task batch
+- 96.8% of episodes clear all 6/6 target joints > 0.1 rad
+- Per-finger position error ‖human_tip − robot_tip‖: median 5–10 mm,
+  p95 10–20 mm (from `notebooks/05_stage3_visualize.py` on a 4-episode
+  sample)
+
+#### What 5–10 mm fingertip error actually means
+
+The Inspire-hand fingerpad is roughly **15 mm wide**, so a 10 mm
+median error is **~60% of the pad width**. For:
+
+- **Power grasps** (stapler, iPhone, mug, can, plushie, donut, …):
+  fine — the contact patch is much larger than the error envelope.
+- **Precision pinches** (screw, bead, cable): marginal to bad — the
+  fingertip would miss the object more often than not.
+
+The 277-episode `basic_pick_place` distribution is overwhelmingly
+power grasps, so we are firmly inside the safe operating regime *for
+this dataset*. The pipeline is not validated for precision tasks.
+
+#### Per-object grasp clustering (`notebooks/07_grasp_clustering.py`)
+
+The single-number question — *does the retargeting actually preserve
+object identity?* — was answered by extracting a per-episode grasp
+signature and grouping by `llm_objects[0]` from the HDF5 attrs. **25
+distinct objects** appear with ≥ 3 episodes each in `basic_pick_place`,
+covering 174 of the 277 episodes (62.8%).
+
+Two signature flavors were tested:
+
+| signature | dim | within std (rad) | between std (rad) | ratio | silhouette | % positive |
+|---|---|---:|---:|---:|---:|---:|
+| **6-D peak grasp** (`q_finger` at most-closed frame) | 6 | 0.143 | 0.115 | **0.81** | **−0.27** | 21% |
+| **18-D trajectory** (per-joint min/max/mean over episode) | 18 | 0.103 | 0.098 | **0.95** | **−0.15** | 28% |
+
+Both ratios are **< 1** and both silhouette scores are **negative**.
+A naive read of those two numbers says "retargeting does not cluster
+by object". But the per-pair distance matrix tells a more nuanced
+story:
+
+**Most-distinct object pairs (18-D, rad):**
+
+| pair | distance | physical interpretation |
+|---|---:|---|
+| dice box vs toy block | 1.34 | large container vs small block |
+| iphone vs toy block | 1.31 | flat thin vs small block |
+| iphone vs fry | 1.26 | flat thin vs irregular |
+| mouse vs toy block | 1.24 | flat thin vs small block |
+| cup vs toy block | 1.24 | curved handle vs small block |
+
+**Most-similar object pairs:**
+
+| pair | distance | physical interpretation |
+|---|---:|---|
+| iphone vs mouse | 0.15 | both flat-and-thin power grips |
+| container of slime vs donut | 0.16 | both ~spherical power grips |
+| plushie vs tea cup | 0.17 | both wide-grip targets |
+| dice vs croissant | 0.19 | both medium-sized softer grips |
+| rubber duck vs strawberry | 0.20 | both small soft round things |
+
+**Pairwise distances among the 6 largest object groups (18-D, rad):**
+
+```
+                  block    duck    plushie    egg    dice    bread
+   block (n=41)     -      0.441    0.511    0.237   0.222   0.384
+   duck  (n=20)   0.441    -        0.210    0.439   0.392   0.474
+ plushie(n=14)    0.511   0.210     -        0.443   0.516   0.409
+   egg   (n=10)   0.237   0.439    0.443      -      0.371   0.261
+   dice  (n= 8)   0.222   0.392    0.516    0.371    -       0.531
+   bread (n= 7)   0.384   0.474    0.409    0.261   0.531    -
+```
+
+Two physically meaningful groupings emerge:
+
+1. **{block, dice, egg}**: small hard compact objects — pairwise
+   distances 0.22–0.37 (close).
+2. **{duck, plushie}**: soft plush — distance 0.21 (close).
+3. Cross-group distances ({block, dice} ↔ {duck, plushie}) are larger
+   (0.39–0.52).
+
+#### Verdict — affordance class, not within-class precision
+
+The retargeting captures **grasp affordance class** (small hard,
+soft plush, flat thin, irregular bulky, …) but does **not** cleanly
+discriminate within an affordance class. The mean silhouette being
+negative reflects the fact that, e.g., an iphone and a mouse really do
+require nearly identical 6-DOF Inspire grasps — calling that a
+"clustering failure" would be overfitting the metric.
+
+This is consistent with three known limits:
+
+1. **6-DOF Inspire** can only express a limited grasp vocabulary on a
+   power-grasp dataset. A real human hand is 25 DOF; the embodiment
+   gap is 19 DOFs of subtle finger dynamics that the retargeting
+   *cannot* recover by construction.
+2. The `llm_objects` labels are **noisy by construction**: "block"
+   covers 41 episodes that are physically a wooden cube, a lego
+   brick, a foam block, etc. — none distinguished in the label.
+   That inflates within-object std with label noise that has nothing
+   to do with retargeting.
+3. **Peak-grasp argmin is single-instant**, so it is dominated by
+   one frame's noise. The 18-D trajectory aggregate softens this and
+   improves the ratio from 0.81 → 0.95 — but it can't fix the
+   embodiment gap.
+
+#### What the retargeting is NOT
+
+To prevent later overclaiming:
+
+- **No physics validation.** We never closed the retargeted hand
+  around a virtual object and checked grasp force closure. The joint
+  angles are kinematically plausible; whether they would *hold* an
+  object is untested.
+- **Open-loop, no contact correction.** No tactile or force feedback;
+  identical to the original MimicDreamer recipe (so we are at parity,
+  not better).
+- **Stage 2 (arm IK) and Stage 3 (finger retargeting) are not
+  jointly optimized.** The wrist pose Stage 2 produces and the wrist
+  pose Stage 3 implicitly assumes (via the dummy free joint) can drift
+  apart at the mount point. Practical drift is small but it is not
+  zero.
+- **Distribution is narrow** — 17.9 minutes of `basic_pick_place`
+  in a single environment. Generalization to other tasks / wearers /
+  scenes is unknown until Stage 4 evals.
+
+#### Why this is enough for Stage 4
+
+For behavioral cloning on this dataset, the action signal needs to
+encode **how to grasp**, not **which object** — object identity comes
+from the RGB observation. The retargeting providing consistent
+affordance-level encodings (close hand for compact items, wider grip
+for flat items, thumb opposition for things that need pinching)
+plus 5–10 mm fingertip precision is *enough signal to learn from*.
+The BC policy will absorb residual retargeting noise the way it
+absorbs visual noise.
+
+The bar this needs to clear is set in `initial_plan.md` §4.4:
+**outperform the binary-gripper baseline in the ablation table.**
+That is the experiment that decides whether the dexterous hand was
+worth the engineering. It has not run yet — the verdict on
+"is the retargeting useful for the policy?" is **TBD until Stage 4**.
+
+#### What would change this assessment
+
+In order of effort:
+
+1. **(easy)** Re-run with a richer trajectory-summary signature
+   (already done — 18-D version, shifts ratio 0.81 → 0.95).
+2. **(medium)** Drop the retargeted hand into MuJoCo, place a
+   primitive object at the right location each frame, close the hand,
+   and check whether the contact set is force-closure stable. This
+   bridges kinematic plausibility to physical feasibility.
+3. **(hard, on-roadmap)** Stage 4 ablation: full pipeline vs binary
+   gripper baseline. Strongest possible validation.
+
+### 8.7.9 Artifact format
 
 `outputs/stage3/<idx>_fingers.npz`:
 
@@ -881,6 +1047,9 @@ Code (read these to verify any claim above):
 | `src/mimicdreamer_egodex/action_alignment.py` | Stage 2 deliverable. UR5e IK (mink FrameTask + smoothness PostureTask) on H2R-aligned wrist poses, plus fingertip-spread gripper signal. CLI: `uv run python -m mimicdreamer_egodex.action_alignment <hdf5> --out-dir outputs/stage2`. Writes `<idx>_actions.npz` + metrics JSON. |
 | `src/mimicdreamer_egodex/finger_retargeting.py` | Stage 3 deliverable. Inspire 6-DOF finger retargeting via `dex-retargeting`'s `PositionOptimizer` on wrist-relative EgoDex fingertip positions. Caches one `SeqRetargeting` per side. CLI: `uv run python -m mimicdreamer_egodex.finger_retargeting <hdf5> --out-dir outputs/stage3`. Writes `<idx>_fingers.npz` + metrics JSON. |
 | `notebooks/04_stage3_batch.py` | Stage 3 full-task batch driver. Runs `process_episode` over every `basic_pick_place` episode (retargeter cached) and writes `outputs/stage3_summary_basic_pick_place.csv` + `outputs/stage3_aggregate.json`. Source of §8.7.5 / §8.7.6 distributions. |
+| `notebooks/05_stage3_visualize.py` | Stage 3 static visualizations: per-episode joint-angle time series, 3D fingertip overlay (human vs Inspire FK), per-finger retarget error, 2x2 overview. Run on any episode index. Source of the 5–10 mm per-finger error numbers in §8.7.8. |
+| `notebooks/06_stage3_animate.py` | Stage 3 animations: stick-figure Inspire MP4, side-by-side EgoDex-vs-Inspire skeleton MP4, MuJoCo offscreen mesh-render MP4. Headless via EGL. Reads from `outputs/stage3/<idx>_fingers.npz`, writes to `outputs/stage3/viz/`. |
+| `notebooks/07_grasp_clustering.py` | Stage 3 quality-assessment: per-object grasp-shape clustering (peak-grasp 6-D and trajectory-aggregate 18-D signatures), separation ratio + silhouette + PCA scatter. Source of the §8.7.8 verdict ("affordance class, not within-class precision"). |
 
 Artifacts:
 
@@ -903,6 +1072,9 @@ Artifacts:
 | `outputs/stage3/<idx>_metrics.json` | Stage 3 per-episode retargeting metrics + variance report |
 | `outputs/stage3_summary_basic_pick_place.csv` | Per-episode Stage 3 metrics (1 row per episode) |
 | `outputs/stage3_aggregate.json` | Stage 3 headline distributions — source for §8.7.5 / §8.7.6 |
+| `outputs/stage3_grasp_clustering.json` | Stage 3 grasp-clustering analysis (per-object signatures, separation ratio, silhouette) — source for §8.7.8 verdict |
+| `outputs/stage3/viz/<idx>_*.{png,mp4}` | Per-episode static plots (joint angles, fingertip 3D, retarget error, overview) and animations (Inspire stick figure, side-by-side, MuJoCo mesh render) |
+| `outputs/stage3/viz/grasp_clustering_*.png` | Cross-episode clustering plots: PCA scatter (peak + trajectory signatures) and per-object signature bar chart |
 | `third_party/dex-urdf/` | Vendored dex-urdf repo @ `7304c7f` (gitignored). Provides Inspire/Allegro/Shadow/LEAP URDFs for Stage 3. Re-clone per README if missing. |
 | `logs/session_2026-04-07.md` | narrative session log |
 | `logs/runs/2026-04-07_*.log` | captured stdout/stderr from every script run |
@@ -920,6 +1092,10 @@ Decisions:
 - `plan.md` R-007 — Inspire hand chosen as Stage 3 dexterous target
 - `plan.md` D-007 — `SeqRetargeting.retarget` needs a pre-sliced `(5, 3)` input
 - `plan.md` D-008 — `uv sync --group <stage>` replaces the active group set
+- `plan.md` R-008 — Stage 3 retargeting quality: affordance-class adequate, not within-class precision
+- `plan.md` D-009 — RunPod needs `apt install libegl1` for MuJoCo headless EGL
+- `plan.md` D-010 — MuJoCo URDF loader needs `strippath="false" discardvisual="true"` injection
+- `plan.md` D-011 — MuJoCo URDF `<mujoco>` extension silently ignores `<visual>` (use 640×480 framebuffer)
 
 If any of the above goes stale, update both this file *and* the matching
 entry in `plan.md` so they don't drift.
